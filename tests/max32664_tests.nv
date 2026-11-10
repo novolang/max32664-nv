@@ -1,0 +1,992 @@
+// max32664_tests — the driver over a double of the hub: a command parser that
+// takes the frames of the MAX32664 User Guide (UG6806 Rev 0, Table 5), keeps a
+// table of answers by family and index, answers the status byte first (Table
+// 4) and then the bytes of the answer, and can NACK its first reads (the hub
+// does while it starts), answer "busy" a number of times, answer a status
+// error for a command, and answer a read one byte short.  The pins are a
+// second double that stamps every event with the clock, so the sequences of
+// the guide (RSTN low for 10 ms, MFIO at the level of the mode, 50 ms) are
+// checked against time.  Every transaction advances the clock by a
+// millisecond and every wait by its length.
+//
+// Log entries: a write is 1, the family, the index, the data bytes, -1; a read
+// is 2, the count, -1.  Pin events: 100 + 10 * pin + level for a set and
+// 200 + 10 * pin + direction for a mode, with the clock at the event.
+//
+// The double's state `st`:
+//   0 the clock in ms   1 transactions so far   2 the transaction that fails
+//   3 the first transaction of a run that all fail   4 1 when a hub is there
+//   10 reads that are NACKed first   11 the key of the last command written
+//   20 answers of 5 (busy) before the real one   30 1 when a read is a byte short
+//   98 pin events so far   99 log entries
+// `resp` holds the answer to a key (family * 256 + index) at key * 100 + i, its
+// length at key * 100 + 99; `err` a status to answer for a key.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_ppg.{ PpgSample, PpgLed, HeartRate }
+use dev_id.{ DeviceId, Identifiable }
+use max32664
+use max32664.{ Max32664, Max32664Config, Max32664Variant, Max32664Report, Max32664Sample, HubVersion, Max32664Port }
+
+struct Hub
+    st: HashMap<Int, Int>
+    resp: HashMap<Int, Int>
+    err: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    pe: HashMap<Int, Int>
+    pt: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// Sets the answer to the command `family`, `index`.
+fn answer(h: Hub, family: Int, index: Int, vals: [Int])
+    let key = family * 256 + index
+    for i in 0..vals.len()
+        h.resp.insert(key * 100 + i, vals[i])
+    h.resp.insert(key * 100 + 99, vals.len())
+
+// A hub in application mode with the answers of the guide's trace (Table 9).
+@tier(app)
+fn hub() -> Hub
+    let h = Hub { st: HashMap.new(), resp: HashMap.new(), err: HashMap.new(), log: HashMap.new(), pe: HashMap.new(), pt: HashMap.new() }
+    h.st.insert(4, 1)
+    answer(h, 0x00, 0x00, [0x88])
+    answer(h, 0x02, 0x00, [0x00])
+    answer(h, 0xFF, 0x00, [0x01])
+    answer(h, 0xFF, 0x03, [0x01, 0x09, 0x00])
+    answer(h, 0xFF, 0x07, [0x0A, 0x01, 0x02])
+    answer(h, 0x81, 0x00, [0x03, 0x00, 0x00])
+    answer(h, 0x81, 0x01, [0x20, 0x00])
+    answer(h, 0x12, 0x00, [0x0F])
+    answer(h, 0x41, 0x03, [0x60])
+    h
+
+fn log_push(h: Hub, v: Int)
+    let n = at(h.st, 99)
+    h.log.insert(n, v)
+    h.st.insert(99, n + 1)
+
+fn log_clear(h: Hub)
+    h.st.insert(99, 0)
+
+// Whether the transaction now being made is one that fails.
+fn fails(h: Hub) -> Bool
+    let n = at(h.st, 1) + 1
+    h.st.insert(1, n)
+    h.st.insert(0, at(h.st, 0) + 1)
+    if at(h.st, 2) == n
+        return true
+    at(h.st, 3) > 0 and n >= at(h.st, 3)
+
+// What a command does besides answering: the mode command moves the mode.
+@tier(app)
+fn effect(h: Hub, family: Int, index: Int, v: Int)
+    if family == 0x01 and index == 0x00
+        if v == 8
+            answer(h, 0x02, 0x00, [0x08])
+        if v == 0
+            answer(h, 0x02, 0x00, [0x00])
+
+struct FakeI2c
+    h: Hub
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.h.st.insert(31, freq)
+
+    @tier(app)
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.h, 1)
+        for i in 0..data.len()
+            log_push(self.h, data[i] as Int)
+        log_push(self.h, -1)
+        if fails(self.h) or addr != 0x55 or at(self.h.st, 4) == 0 or data.len() < 2
+            return false
+        let family = data[0] as Int
+        let index = data[1] as Int
+        self.h.st.insert(11, family * 256 + index)
+        if data.len() > 2
+            effect(self.h, family, index, data[2] as Int)
+        true
+
+    @tier(app)
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        log_push(self.h, 2)
+        log_push(self.h, n)
+        log_push(self.h, -1)
+        if fails(self.h) or addr != 0x55 or at(self.h.st, 4) == 0
+            return None
+        if at(self.h.st, 10) > 0
+            self.h.st.insert(10, at(self.h.st, 10) - 1)
+            return None
+        let key = at(self.h.st, 11)
+        var status = at(self.h.err, key)
+        if at(self.h.st, 20) > 0
+            self.h.st.insert(20, at(self.h.st, 20) - 1)
+            status = 5
+        var out: [u8] = []
+        list.push(out, status as u8)
+        let len = at(self.h.resp, key * 100 + 99)
+        var total = n
+        if at(self.h.st, 30) == 1
+            total = n - 1
+        for i in 0..(total - 1)
+            if status == 0 and i < len
+                list.push(out, at(self.h.resp, key * 100 + i) as u8)
+            else
+                list.push(out, 0 as u8)
+        Some(out)
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        None
+
+struct FakePins
+    h: Hub
+    levels: HashMap<Int, Int>
+
+fn pin_event(h: Hub, code: Int)
+    let n = at(h.st, 98)
+    h.pe.insert(n, code)
+    h.pt.insert(n, at(h.st, 0))
+    h.st.insert(98, n + 1)
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        pin_event(self.h, 200 + pin * 10 + dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        pin_event(self.h, 100 + pin * 10 + val)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+@tier(app)
+fn pins(h: Hub) -> FakePins
+    FakePins { h: h, levels: HashMap.new() }
+
+// The hub's wiring: address 0x55, MFIO on pin 7, RSTN on pin 8.
+fn wiring() -> DeviceWiring
+    dev_bus.wiring_en(dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x55), 7), 8)
+
+fn wiring_no_pins() -> DeviceWiring
+    dev_bus.wiring_i2c(0, 0x55)
+
+fn wiring_no_rstn() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x55), 7)
+
+fn wiring_no_mfio() -> DeviceWiring
+    dev_bus.wiring_en(dev_bus.wiring_i2c(0, 0x55), 8)
+
+struct Dut
+    bus: FakeI2c
+    pins: FakePins
+    h: Hub
+    w: DeviceWiring
+
+impl Max32664Port for Dut
+    fn setup(self) -> Bool [hw]
+        max32664.i2c_setup(self.bus, self.w)
+
+    fn write_cmd(self, family: Int, src: DevBytes) -> Bool [hw]
+        max32664.i2c_write_cmd(self.bus, self.w, family, src)
+
+    fn read_resp(self, n: Int, var dst: DevBytes) -> Bool [hw]
+        max32664.i2c_read_resp(self.bus, self.w, n, var dst)
+
+    fn now_ms(self) -> Int [hw]
+        at(self.h.st, 0)
+
+    fn now_us(self) -> Int [hw]
+        at(self.h.st, 0) * 1000
+
+    fn wait_ms(self, ms: Int) [hw]
+        self.h.st.insert(0, at(self.h.st, 0) + ms)
+
+    fn rstn(self, level: Int) -> Bool [hw]
+        max32664.rstn_of(self.pins, self.w, level)
+
+    fn mfio_out(self, level: Int) -> Bool [hw]
+        max32664.mfio_out_of(self.pins, self.w, level)
+
+    fn mfio_in(self) -> Bool [hw]
+        max32664.mfio_in_of(self.pins, self.w)
+
+    fn mfio_level(self) -> Int [hw]
+        max32664.mfio_level_of(self.pins, self.w)
+
+@tier(app)
+fn dut(h: Hub) -> Dut
+    Dut { bus: FakeI2c { h: h }, pins: pins(h), h: h, w: wiring() }
+
+@tier(app)
+fn dut_with(h: Hub, w: DeviceWiring) -> Dut
+    Dut { bus: FakeI2c { h: h }, pins: pins(h), h: h, w: w }
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(h: Hub, want: [Int])
+    test.assert_eq(at(h.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(h.log, i), want[i])
+    log_clear(h)
+
+// Asserts the pin events are exactly `want`, then empties them.
+fn pins_are(h: Hub, want: [Int])
+    test.assert_eq(at(h.st, 98), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(h.pe, i), want[i])
+    h.st.insert(98, 0)
+
+// The guide's trace sample (Table 9): IR 223811, red 197778 (the guide prints
+// 19778, a digit short of the bytes 0x03 0x04 0x92), LED3 0, LED4 11797, heart
+// rate 63.0, confidence 99, SpO2 99.6, state 3.
+fn trace_sample() -> [Int]
+    [0x03, 0x6A, 0x43, 0x03, 0x04, 0x92, 0x00, 0x00, 0x00, 0x00, 0x2E, 0x15, 0x02, 0x76, 0x63, 0x03, 0xE4, 0x03]
+
+fn cfg_of(output: Int, algo: Int) -> Max32664Config
+    Max32664Config { variant: Max32664Variant.VariantA, output: output, algo_mode: algo, threshold: 15, agc: true }
+
+// ── The command frame ────────────────────────────────────────────────
+
+@test
+fn test_a_command_is_a_write_of_family_and_index_then_a_read_of_status_and_answer() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    let data: DevBytes = Vec.new()
+    var out: DevBytes = Vec.new()
+    test.assert_eq(max32664.xfer(d, 0x00, 0x00, data, 1, 2, var out), 0)
+    log_is(h, [1, 0x00, 0x00, -1, 2, 2, -1])
+    test.assert_eq(out.len(), 1)
+    test.assert_eq(out[0] as Int, 0x88)
+
+@test
+fn test_the_data_bytes_follow_the_index_and_the_wait_is_taken_between() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    var data: DevBytes = Vec.new()
+    let _ = data.push(0x0D as u8)
+    let _ = data.push(0x32 as u8)
+    var out: DevBytes = Vec.new()
+    test.assert_eq(max32664.xfer(d, 0x40, 0x03, data, 0, 45, var out), 0)
+    log_is(h, [1, 0x40, 0x03, 0x0D, 0x32, -1, 2, 1, -1])
+    // Two transactions of a millisecond and the wait of 45.
+    test.assert_eq(at(h.st, 0), 47)
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_a_count_outside_0_to_31_is_refused_without_a_transaction() [io, hw]
+    let h = hub()
+    let data: DevBytes = Vec.new()
+    var out: DevBytes = Vec.new()
+    test.assert_eq(max32664.xfer(dut(h), 0x00, 0x00, data, -1, 2, var out), -1)
+    test.assert_eq(max32664.xfer(dut(h), 0x00, 0x00, data, 32, 2, var out), -1)
+    test.assert_eq(at(h.st, 1), 0)
+
+@test
+fn test_a_bus_failure_answers_minus_one_and_is_not_retried() [io, hw]
+    let h = hub()
+    h.st.insert(2, 1)
+    let data: DevBytes = Vec.new()
+    var out: DevBytes = Vec.new()
+    test.assert_eq(max32664.xfer(dut(h), 0x00, 0x00, data, 1, 2, var out), -1)
+    test.assert_eq(at(h.st, 1), 1)
+    let h2 = hub()
+    h2.st.insert(2, 2)
+    test.assert_eq(max32664.xfer(dut(h2), 0x00, 0x00, data, 1, 2, var out), -1)
+    test.assert_eq(at(h2.st, 1), 2)
+
+@test
+fn test_a_short_read_is_a_failure_and_not_data() [io, hw]
+    let h = hub()
+    h.st.insert(30, 1)
+    let data: DevBytes = Vec.new()
+    var out: DevBytes = Vec.new()
+    test.assert_eq(max32664.xfer(dut(h), 0x00, 0x00, data, 1, 2, var out), -1)
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_every_status_of_table_4_is_answered_and_carries_no_data() [io, hw]
+    for st in [1, 2, 3, 4, 0x80, 0x81, 0x82, 0x83, 0xFF]
+        let h = hub()
+        h.err.insert(0x0000, st)
+        let data: DevBytes = Vec.new()
+        var out: DevBytes = Vec.new()
+        test.assert_eq(max32664.xfer(dut(h), 0x00, 0x00, data, 1, 2, var out), st)
+        test.assert_eq(out.len(), 0)
+        test.assert_eq(at(h.st, 1), 2)
+
+@test
+fn test_a_busy_hub_is_asked_again_up_to_three_times() [io, hw]
+    let h = hub()
+    h.st.insert(20, 2)
+    let data: DevBytes = Vec.new()
+    var out: DevBytes = Vec.new()
+    test.assert_eq(max32664.xfer(dut(h), 0x00, 0x00, data, 1, 2, var out), 0)
+    test.assert_eq(at(h.st, 1), 6)
+    test.assert_eq(out[0] as Int, 0x88)
+    let h2 = hub()
+    h2.st.insert(20, 10)
+    test.assert_eq(max32664.xfer(dut(h2), 0x00, 0x00, data, 1, 2, var out), 5)
+    test.assert_eq(at(h2.st, 1), 6)
+
+@test
+fn test_a_command_that_the_hub_refused_is_false() [io, hw]
+    let h = hub()
+    h.err.insert(0x1000, 4)
+    test.assert(not max32664.cmd1(dut(h), 0x10, 0x00, 9, 2))
+    test.assert(not max32664.cmd2(dut(h), 0x10, 0x00, 9, 9, 2))
+    var out: DevBytes = Vec.new()
+    test.assert(not max32664.read_cmd(dut(h), 0x10, 0x00, 1, var out))
+    test.assert(max32664.cmd1(dut(h), 0x10, 0x01, 15, 2))
+    test.assert(max32664.cmd2(dut(h), 0x10, 0x01, 15, 1, 2))
+
+// ── The hub ──────────────────────────────────────────────────────────
+
+@test
+fn test_the_status_byte_has_the_bits_of_table_6() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    test.assert(max32664.status_read(d) == Some(0x88))
+    test.assert(max32664.status_data_ready(0x88))
+    test.assert(not max32664.status_fifo_overflow(0x88))
+    test.assert(not max32664.status_busy(0x88))
+    test.assert(not max32664.status_sensor_error(0x88))
+    test.assert(max32664.status_fifo_overflow(0x10))
+    test.assert(max32664.status_busy(0x40))
+    test.assert(max32664.status_sensor_error(0x01))
+    test.assert(not max32664.status_data_ready(0x00))
+    h.st.insert(4, 0)
+    test.assert(max32664.status_read(d) == None)
+
+@test
+fn test_the_mode_is_read_and_set_by_command() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    test.assert(max32664.mode_read(d) == Some(0))
+    log_clear(h)
+    test.assert(max32664.mode_set(d, 8))
+    log_is(h, [1, 0x01, 0x00, 0x08, -1, 2, 1, -1])
+    test.assert(max32664.mode_read(d) == Some(8))
+    test.assert(max32664.mode_set(d, 0))
+    test.assert(max32664.mode_read(d) == Some(0))
+    test.assert(max32664.mode_set(d, 2))
+    log_clear(h)
+    test.assert(not max32664.mode_set(d, 1))
+    test.assert(not max32664.mode_set(d, 9))
+    test.assert_eq(at(h.st, 99), 0)
+    h.st.insert(4, 0)
+    test.assert(max32664.mode_read(d) == None)
+
+@test
+fn test_the_versions_are_three_bytes_each() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    // The guide's traces: sensor hub 1.9.0, bootloader 3.0.0, page 8192.
+    match max32664.hub_version(d)
+        Some(v) =>
+            test.assert_eq(v.major, 1)
+            test.assert_eq(v.minor, 9)
+            test.assert_eq(v.rev, 0)
+        None => test.assert(false)
+    log_is(h, [1, 0xFF, 0x03, -1, 2, 4, -1])
+    match max32664.algo_version(d)
+        Some(v) => test.assert_eq(v.major, 10)
+        None => test.assert(false)
+    match max32664.bootloader_version(d)
+        Some(v) =>
+            test.assert_eq(v.major, 3)
+            test.assert_eq(v.minor, 0)
+        None => test.assert(false)
+    test.assert(max32664.bootloader_page_size(d) == Some(8192))
+    test.assert(max32664.mcu_type(d) == Some(1))
+    h.st.insert(4, 0)
+    test.assert(max32664.hub_version(d) == None)
+    test.assert(max32664.bootloader_page_size(d) == None)
+    test.assert(max32664.mcu_type(d) == None)
+
+@test
+fn test_a_version_is_read_at_any_family_and_index() [io, hw]
+    let h = hub()
+    answer(h, 0x55, 0x66, [4, 5, 6])
+    match max32664.version_of(dut(h), 0x55, 0x66)
+        Some(v) =>
+            test.assert_eq(v.major, 4)
+            test.assert_eq(v.minor, 5)
+            test.assert_eq(v.rev, 6)
+        None => test.assert(false)
+    h.err.insert(0x5566, 1)
+    test.assert(max32664.version_of(dut(h), 0x55, 0x66) == None)
+
+@test
+fn test_the_identity_is_the_mcu_type_and_the_firmware_major_version() [io, hw]
+    let h = hub()
+    test.assert(max32664.id_read(dut(h)) == Some(DeviceId { who: 1, rev: Some(1) }))
+    let h2 = hub()
+    answer(h2, 0xFF, 0x00, [0x00])
+    test.assert(max32664.id_read(dut(h2)) == None)
+    let h3 = hub()
+    h3.err.insert(0xFF03, 1)
+    test.assert(max32664.id_read(dut(h3)) == Some(DeviceId { who: 1, rev: None }))
+    let h4 = hub()
+    h4.st.insert(4, 0)
+    test.assert(max32664.id_read(dut(h4)) == None)
+
+// ── The pins that choose the mode ────────────────────────────────────
+
+@test
+fn test_the_application_sequence_is_rstn_low_10_ms_mfio_high_rstn_high_50_ms() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    test.assert(max32664.reset_into(d, 1))
+    // RSTN low, MFIO an output driven high, RSTN high.
+    pins_are(h, [281, 180, 271, 171, 281, 181])
+    test.assert_eq(at(h.pt, 5) - at(h.pt, 1), 10)
+    test.assert_eq(at(h.st, 0) - at(h.pt, 5), 50)
+
+@test
+fn test_the_bootloader_sequence_has_mfio_low() [io, hw]
+    let h = hub()
+    test.assert(max32664.reset_into(dut(h), 0))
+    pins_are(h, [281, 180, 271, 170, 281, 181])
+
+@test
+fn test_a_sequence_without_both_pins_is_refused() [io, hw]
+    let h = hub()
+    test.assert(not max32664.reset_into(dut_with(h, wiring_no_pins()), 1))
+    test.assert_eq(at(h.st, 98), 0)
+    test.assert(not max32664.reset_into(dut_with(h, wiring_no_rstn()), 1))
+    test.assert_eq(at(h.st, 98), 0)
+    test.assert(not max32664.reset_into(dut_with(h, wiring_no_mfio()), 1))
+    // RSTN was taken low before the missing MFIO was found out.
+    pins_are(h, [281, 180])
+
+@test
+fn test_the_application_is_entered_with_mfio_released_as_the_interrupt() [io, hw]
+    let h = hub()
+    test.assert(max32664.enter_app_mode(dut(h)))
+    pins_are(h, [281, 180, 271, 171, 281, 181, 272])
+
+@test
+fn test_the_wait_for_the_application_polls_through_the_nacks_of_a_starting_hub() [io, hw]
+    let h = hub()
+    h.st.insert(10, 40)
+    test.assert(max32664.enter_app_mode(dut(h)))
+    // 40 NACKs and the answer: 41 reads (each a write and a read).
+    test.assert_eq(at(h.st, 1), 82)
+
+@test
+fn test_the_wait_for_the_application_gives_up_after_1_7_s() [io, hw]
+    let h = hub()
+    h.st.insert(4, 0)
+    test.assert(not max32664.enter_app_mode(dut(h)))
+    test.assert(at(h.st, 0) >= 1700)
+
+@test
+fn test_a_hub_that_answers_in_the_other_mode_ends_the_wait_at_once() [io, hw]
+    let h = hub()
+    answer(h, 0x02, 0x00, [0x08])
+    test.assert(not max32664.enter_app_mode(dut(h)))
+    test.assert_eq(at(h.st, 1), 2)
+    let h2 = hub()
+    test.assert(not max32664.enter_bootloader(dut(h2)))
+    test.assert_eq(at(h2.st, 1), 2)
+
+@test
+fn test_the_mode_wait_returns_at_the_first_answer_and_polls_every_10_ms() [io, hw]
+    let h = hub()
+    h.st.insert(10, 3)
+    test.assert(max32664.mode_wait(dut(h), 0, 1000))
+    // Three NACKs and the answer, a poll of 10 ms between them.
+    test.assert_eq(at(h.st, 1), 8)
+    test.assert(at(h.st, 0) >= 30)
+    test.assert(not max32664.mode_wait(dut(h), 8, 1000))
+
+@test
+fn test_the_bootloader_is_entered_and_its_mfio_stays_an_output() [io, hw]
+    let h = hub()
+    answer(h, 0x02, 0x00, [0x08])
+    test.assert(max32664.enter_bootloader(dut(h)))
+    pins_are(h, [281, 180, 271, 170, 281, 181])
+    let h2 = hub()
+    h2.st.insert(4, 0)
+    test.assert(not max32664.enter_bootloader(dut(h2)))
+    test.assert(at(h2.st, 0) >= 200)
+
+@test
+fn test_the_mode_wait_is_refused_without_the_pins() [io, hw]
+    let h = hub()
+    test.assert(not max32664.enter_app_mode(dut_with(h, wiring_no_pins())))
+    test.assert(not max32664.enter_bootloader(dut_with(h, wiring_no_pins())))
+    test.assert_eq(at(h.st, 1), 0)
+
+@test
+fn test_the_pins_are_driven_and_read_through_the_wiring() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    d.pins.levels.insert(7, 1)
+    test.assert_eq(max32664.mfio_level_of(d.pins, d.w), 1)
+    test.assert(max32664.mfio_in_of(d.pins, d.w))
+    pins_are(h, [272])
+    let p = dut_with(h, wiring_no_pins())
+    test.assert_eq(max32664.mfio_level_of(p.pins, p.w), -1)
+    test.assert(not max32664.mfio_in_of(p.pins, p.w))
+    test.assert(not max32664.mfio_out_of(p.pins, p.w, 1))
+    test.assert(not max32664.rstn_of(p.pins, p.w, 1))
+    test.assert_eq(at(h.st, 98), 0)
+
+@test
+fn test_the_bus_is_set_up_at_400_khz() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    test.assert(max32664.i2c_setup(d.bus, d.w))
+    test.assert_eq(at(h.st, 31), 400000)
+    let nowhere = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    test.assert(not max32664.i2c_setup(d.bus, nowhere))
+    var dst: DevBytes = Vec.new()
+    test.assert(not max32664.i2c_read_resp(d.bus, nowhere, 1, var dst))
+    test.assert(not max32664.i2c_read_resp(d.bus, d.w, 33, var dst))
+    let src: DevBytes = Vec.new()
+    test.assert(not max32664.i2c_write_cmd(d.bus, nowhere, 0x00, src))
+
+// ── The configuration ────────────────────────────────────────────────
+
+@test
+fn test_the_default_configuration_is_the_guide_s_trace_with_the_agc() [io, hw]
+    let c = max32664.config_default()
+    test.assert(c.variant == Max32664Variant.VariantA)
+    test.assert_eq(c.output, 3)
+    test.assert_eq(c.algo_mode, 1)
+    test.assert_eq(c.threshold, 15)
+    test.assert(c.agc)
+    test.assert(max32664.config_ok(c))
+
+@test
+fn test_only_the_a_variant_with_a_valid_mode_is_run() [io, hw]
+    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantB, output: 3, algo_mode: 1, threshold: 15, agc: true }))
+    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantC, output: 3, algo_mode: 1, threshold: 15, agc: true }))
+    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantD, output: 3, algo_mode: 1, threshold: 15, agc: true }))
+    test.assert(not max32664.config_ok(cfg_of(0, 1)))
+    test.assert(not max32664.config_ok(cfg_of(4, 1)))
+    test.assert(not max32664.config_ok(cfg_of(5, 1)))
+    test.assert(not max32664.config_ok(cfg_of(3, -1)))
+    test.assert(not max32664.config_ok(cfg_of(3, 3)))
+    test.assert(not max32664.config_ok(cfg_of(2, 0)))
+    test.assert(not max32664.config_ok(cfg_of(3, 0)))
+    test.assert(max32664.config_ok(cfg_of(1, 0)))
+    test.assert(max32664.config_ok(cfg_of(2, 2)))
+    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantA, output: 3, algo_mode: 1, threshold: 0, agc: true }))
+    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantA, output: 3, algo_mode: 1, threshold: 256, agc: true }))
+    test.assert(max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantA, output: 3, algo_mode: 1, threshold: 255, agc: false }))
+
+@test
+fn test_a_sample_is_12_bytes_of_leds_and_6_or_11_of_report() [io, hw]
+    test.assert_eq(max32664.sample_bytes(cfg_of(1, 0)), 12)
+    test.assert_eq(max32664.sample_bytes(cfg_of(2, 1)), 6)
+    test.assert_eq(max32664.sample_bytes(cfg_of(3, 1)), 18)
+    test.assert_eq(max32664.sample_bytes(cfg_of(2, 2)), 11)
+    test.assert_eq(max32664.sample_bytes(cfg_of(3, 2)), 23)
+    test.assert_eq(max32664.sample_bytes(cfg_of(1, 1)), 12)
+
+@test
+fn test_the_output_mode_and_the_threshold_are_written_as_the_guide_has_them() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    test.assert(max32664.output_mode_set(d, 3))
+    log_is(h, [1, 0x10, 0x00, 0x03, -1, 2, 1, -1])
+    test.assert(max32664.output_mode_set(d, 0))
+    test.assert(max32664.output_mode_set(d, 4))
+    log_clear(h)
+    // The modes with a counter byte are NOT IMPLEMENTED and refused unsent.
+    test.assert(not max32664.output_mode_set(d, 5))
+    test.assert(not max32664.output_mode_set(d, 7))
+    test.assert(not max32664.output_mode_set(d, -1))
+    test.assert_eq(at(h.st, 99), 0)
+    test.assert(max32664.threshold_set(d, 15))
+    log_is(h, [1, 0x10, 0x01, 0x0F, -1, 2, 1, -1])
+    test.assert(max32664.threshold_set(d, 1))
+    test.assert(max32664.threshold_set(d, 255))
+    log_clear(h)
+    test.assert(not max32664.threshold_set(d, 0))
+    test.assert(not max32664.threshold_set(d, 256))
+    test.assert_eq(at(h.st, 99), 0)
+
+@test
+fn test_the_enables_take_45_ms() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    test.assert(max32664.afe_enable(d, true))
+    log_is(h, [1, 0x44, 0x03, 0x01, -1, 2, 1, -1])
+    test.assert(at(h.st, 0) >= 47)
+    test.assert(max32664.afe_enable(d, false))
+    log_is(h, [1, 0x44, 0x03, 0x00, -1, 2, 1, -1])
+    test.assert(max32664.agc_enable(d, true))
+    log_is(h, [1, 0x52, 0x00, 0x01, -1, 2, 1, -1])
+    test.assert(max32664.agc_enable(d, false))
+    log_is(h, [1, 0x52, 0x00, 0x00, -1, 2, 1, -1])
+    h.st.insert(0, 0)
+    test.assert(max32664.algo_enable(d, 1))
+    log_is(h, [1, 0x52, 0x02, 0x01, -1, 2, 1, -1])
+    test.assert(at(h.st, 0) >= 47)
+    test.assert(max32664.algo_enable(d, 2))
+    test.assert(max32664.algo_enable(d, 0))
+    log_clear(h)
+    test.assert(not max32664.algo_enable(d, 3))
+    test.assert(not max32664.algo_enable(d, -1))
+    test.assert_eq(at(h.st, 99), 0)
+
+@test
+fn test_a_register_of_the_max30101_is_read_and_written_through_the_hub() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    // The guide's trace reads register 7 as 0x60.
+    test.assert(max32664.afe_reg_read(d, 0x07) == Some(0x60))
+    log_is(h, [1, 0x41, 0x03, 0x07, -1, 2, 2, -1])
+    test.assert(max32664.afe_reg_write(d, 0x0D, 0x32))
+    log_is(h, [1, 0x40, 0x03, 0x0D, 0x32, -1, 2, 1, -1])
+    h.err.insert(0x4103, 4)
+    test.assert(max32664.afe_reg_read(d, 0x07) == None)
+    h.err.insert(0x4003, 4)
+    test.assert(not max32664.afe_reg_write(d, 0x0D, 0x32))
+
+@test
+fn test_sampling_starts_in_the_order_of_the_guide_s_trace() [io, hw]
+    let h = hub()
+    test.assert(max32664.sampling_start(dut(h), max32664.config_default()))
+    log_is(h, [1, 0x10, 0x00, 0x03, -1, 2, 1, -1,
+               1, 0x10, 0x01, 0x0F, -1, 2, 1, -1,
+               1, 0x52, 0x00, 0x01, -1, 2, 1, -1,
+               1, 0x44, 0x03, 0x01, -1, 2, 1, -1,
+               1, 0x52, 0x02, 0x01, -1, 2, 1, -1])
+
+@test
+fn test_sampling_with_no_agc_and_the_extended_report() [io, hw]
+    let h = hub()
+    let c = Max32664Config { variant: Max32664Variant.VariantA, output: 2, algo_mode: 2, threshold: 1, agc: false }
+    test.assert(max32664.sampling_start(dut(h), c))
+    test.assert_eq(at(h.log, 3), 0x02)
+    test.assert_eq(at(h.log, 11), 0x01)
+    test.assert_eq(at(h.log, 19), 0x00)
+    test.assert_eq(at(h.log, 35), 0x02)
+
+@test
+fn test_sampling_start_fails_on_any_one_failed_transaction() [io, hw]
+    for k in 1..11
+        let h = hub()
+        h.st.insert(2, k)
+        test.assert(not max32664.sampling_start(dut(h), max32664.config_default()))
+    let h2 = hub()
+    test.assert(not max32664.sampling_start(dut(h2), Max32664Config { variant: Max32664Variant.VariantD, output: 3, algo_mode: 1, threshold: 15, agc: true }))
+    test.assert_eq(at(h2.st, 1), 0)
+
+@test
+fn test_sampling_stop_attempts_all_three_commands() [io, hw]
+    let h = hub()
+    test.assert(max32664.sampling_stop(dut(h)))
+    log_is(h, [1, 0x52, 0x02, 0x00, -1, 2, 1, -1,
+               1, 0x44, 0x03, 0x00, -1, 2, 1, -1,
+               1, 0x10, 0x00, 0x00, -1, 2, 1, -1])
+    let h2 = hub()
+    h2.err.insert(0x5202, 4)
+    test.assert(not max32664.sampling_stop(dut(h2)))
+    test.assert_eq(at(h2.st, 1), 6)
+
+@test
+fn test_bring_up_resets_into_the_application_and_starts_sampling() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    test.assert(max32664.bring_up(d, max32664.config_default()))
+    pins_are(h, [281, 180, 271, 171, 281, 181, 272])
+    test.assert_eq(at(h.st, 31), 400000)
+    test.assert_eq(at(h.log, 0), 1)
+    test.assert_eq(at(h.log, 1), 0x02)
+    test.assert_eq(at(h.st, 1), 2 + 10)
+
+@test
+fn test_bring_up_fails_for_a_bad_configuration_a_missing_address_and_a_silent_hub() [io, hw]
+    let h = hub()
+    test.assert(not max32664.bring_up(dut(h), cfg_of(2, 0)))
+    test.assert_eq(at(h.st, 98), 0)
+    let h2 = hub()
+    let nowhere = DeviceWiring { bus: 0, addr: None, cs: None, irq: Some(7), en: Some(8) }
+    test.assert(not max32664.bring_up(dut_with(h2, nowhere), max32664.config_default()))
+    test.assert_eq(at(h2.st, 98), 0)
+    let h3 = hub()
+    h3.st.insert(4, 0)
+    test.assert(not max32664.bring_up(dut(h3), max32664.config_default()))
+    let h4 = hub()
+    test.assert(not max32664.bring_up(dut_with(h4, wiring_no_pins()), max32664.config_default()))
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_samples_waiting_are_asked_of_the_hub() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    test.assert(max32664.samples_available(d) == Some(15))
+    log_is(h, [1, 0x12, 0x00, -1, 2, 2, -1])
+    h.st.insert(4, 0)
+    test.assert(max32664.samples_available(d) == None)
+
+@test
+fn test_the_counts_are_big_endian() [io, hw]
+    var b: DevBytes = Vec.new()
+    for x in [0x01, 0x02, 0x03, 0x04]
+        let _ = b.push(x as u8)
+    test.assert_eq(max32664.count24(b, 0), 0x010203)
+    test.assert_eq(max32664.count24(b, 1), 0x020304)
+    test.assert_eq(max32664.word16(b, 2), 0x0304)
+
+@test
+fn test_the_report_and_the_sample_decode_from_bytes_at_an_offset() [io, hw]
+    var b: DevBytes = Vec.new()
+    for x in trace_sample()
+        let _ = b.push(x as u8)
+    let r = max32664.report_of(b, 12, false)
+    test.assert_eq(r.heart_rate_x10, 630)
+    test.assert_eq(r.confidence, 99)
+    test.assert_eq(r.spo2_x10, 996)
+    test.assert_eq(r.state, 3)
+    let s = max32664.sample_of(b, cfg_of(3, 1))
+    test.assert_eq(s.led1, 223811)
+    test.assert_eq(s.led4, 11797)
+    test.assert(s.report != None)
+
+@test
+fn test_the_trace_sample_decodes_as_the_guide_describes_it() [io, hw]
+    let h = hub()
+    answer(h, 0x12, 0x01, trace_sample())
+    let d = dut(h)
+    match max32664.sample_read(d, cfg_of(3, 1))
+        Some(s) =>
+            test.assert_eq(s.led1, 223811)
+            test.assert_eq(s.led2, 197778)
+            test.assert_eq(s.led3, 0)
+            test.assert_eq(s.led4, 11797)
+            match s.report
+                Some(r) =>
+                    test.assert_eq(r.heart_rate_x10, 630)
+                    test.assert_eq(r.confidence, 99)
+                    test.assert_eq(r.spo2_x10, 996)
+                    test.assert_eq(r.state, 3)
+                    test.assert_eq(r.r_x10, 0)
+                    test.assert_eq(r.ext_state, 0)
+                None => test.assert(false)
+        None => test.assert(false)
+    log_is(h, [1, 0x12, 0x01, -1, 2, 19, -1])
+
+@test
+fn test_an_output_of_the_algorithm_only_starts_the_report_at_byte_0() [io, hw]
+    let h = hub()
+    answer(h, 0x12, 0x01, [0x02, 0x76, 0x63, 0x03, 0xE4, 0x03])
+    let d = dut(h)
+    match max32664.report_read(d, cfg_of(2, 1))
+        Some(r) =>
+            test.assert_eq(r.heart_rate_x10, 630)
+            test.assert_eq(r.spo2_x10, 996)
+        None => test.assert(false)
+    log_is(h, [1, 0x12, 0x01, -1, 2, 7, -1])
+    match max32664.sample_read(d, cfg_of(2, 1))
+        Some(s) => test.assert_eq(s.led1, 0)
+        None => test.assert(false)
+
+@test
+fn test_an_output_of_the_sensor_only_has_no_report() [io, hw]
+    let h = hub()
+    answer(h, 0x12, 0x01, [0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x00, 0x04])
+    let d = dut(h)
+    match max32664.sample_read(d, cfg_of(1, 0))
+        Some(s) =>
+            test.assert_eq(s.led1, 1)
+            test.assert_eq(s.led2, 2)
+            test.assert_eq(s.led3, 3)
+            test.assert_eq(s.led4, 4)
+            test.assert(s.report == None)
+        None => test.assert(false)
+    log_clear(h)
+    test.assert(max32664.report_read(d, cfg_of(1, 0)) == None)
+    test.assert_eq(at(h.st, 99), 0)
+
+@test
+fn test_the_extended_report_adds_the_r_value_and_the_extended_state() [io, hw]
+    let h = hub()
+    answer(h, 0x12, 0x01, [0x02, 0x76, 0x63, 0x03, 0xE4, 0x03, 0x00, 0x7B, 0x05, 0x00, 0x00])
+    match max32664.report_read(dut(h), cfg_of(2, 2))
+        Some(r) =>
+            test.assert_eq(r.heart_rate_x10, 630)
+            test.assert_eq(r.r_x10, 123)
+            test.assert_eq(r.ext_state, 5)
+        None => test.assert(false)
+    log_is(h, [1, 0x12, 0x01, -1, 2, 12, -1])
+
+@test
+fn test_a_failed_sample_read_answers_nothing() [io, hw]
+    let h = hub()
+    h.st.insert(4, 0)
+    test.assert(max32664.sample_read(dut(h), cfg_of(3, 1)) == None)
+    test.assert(max32664.report_read(dut(h), cfg_of(3, 1)) == None)
+
+@test
+fn test_a_report_is_good_when_a_finger_is_found_with_enough_confidence() [io, hw]
+    let good = Max32664Report { heart_rate_x10: 630, confidence: 99, spo2_x10: 996, state: 3, r_x10: 0, ext_state: 0 }
+    test.assert(max32664.report_good(good, 90))
+    test.assert(max32664.report_good(good, 99))
+    test.assert(not max32664.report_good(good, 100))
+    let none = Max32664Report { heart_rate_x10: 0, confidence: 99, spo2_x10: 0, state: 0, r_x10: 0, ext_state: 0 }
+    test.assert(not max32664.report_good(none, 0))
+    let other = Max32664Report { heart_rate_x10: 0, confidence: 99, spo2_x10: 0, state: 2, r_x10: 0, ext_state: 0 }
+    test.assert(not max32664.report_good(other, 0))
+
+// ── The PPG samples ──────────────────────────────────────────────────
+
+@test
+fn test_the_fifo_is_drained_one_sample_at_a_time_oldest_first() [io, hw]
+    let h = hub()
+    answer(h, 0x12, 0x00, [3])
+    answer(h, 0x12, 0x01, trace_sample())
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max32664.drain(dut(h), cfg_of(3, 1), var out), 3)
+    test.assert_eq(out.len(), 3)
+    for i in 0..3
+        test.assert_eq(out[i].ir, 223811)
+        test.assert_eq(out[i].red, 197778)
+        test.assert(out[i].green == Some(0))
+    // The newest is stamped with the tick, the older ones 10 ms apart before it.
+    test.assert_eq(out[1].at_us - out[0].at_us, 10000)
+    test.assert_eq(out[2].at_us - out[1].at_us, 10000)
+    // The count, then three reads of 19 bytes.
+    test.assert_eq(at(h.st, 1), 2 + 6)
+
+@test
+fn test_a_drain_of_an_empty_fifo_or_of_an_output_without_sensor_data_is_zero() [io, hw]
+    let h = hub()
+    answer(h, 0x12, 0x00, [0])
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max32664.drain(dut(h), cfg_of(3, 1), var out), 0)
+    test.assert_eq(at(h.st, 1), 2)
+    let h2 = hub()
+    test.assert_eq(max32664.drain(dut(h2), cfg_of(2, 1), var out), 0)
+    test.assert_eq(at(h2.st, 1), 0)
+
+@test
+fn test_a_drain_reads_at_most_32_samples() [io, hw]
+    let h = hub()
+    answer(h, 0x12, 0x00, [40])
+    answer(h, 0x12, 0x01, trace_sample())
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max32664.drain(dut(h), cfg_of(3, 1), var out), 32)
+    test.assert_eq(out.len(), 32)
+
+@test
+fn test_a_drain_fails_when_the_count_or_a_sample_cannot_be_read() [io, hw]
+    let h = hub()
+    h.st.insert(4, 0)
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(max32664.drain(dut(h), cfg_of(3, 1), var out), -1)
+    let h2 = hub()
+    answer(h2, 0x12, 0x00, [3])
+    answer(h2, 0x12, 0x01, trace_sample())
+    // The count is transactions 1 and 2; the second sample's write is the 5th.
+    h2.st.insert(2, 5)
+    test.assert_eq(max32664.drain(dut(h2), cfg_of(3, 1), var out), -1)
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_the_overflow_flag_of_the_status_is_the_lost_count() [io, hw]
+    let h = hub()
+    let d = dut(h)
+    test.assert_eq(max32664.lost(d), 0)
+    answer(h, 0x00, 0x00, [0x98])
+    test.assert_eq(max32664.lost(d), 1)
+    h.st.insert(4, 0)
+    test.assert_eq(max32664.lost(d), 0)
+
+@test
+fn test_the_rate_is_the_one_rate_of_the_firmware_once_sampling_started() [io, hw]
+    let h = hub()
+    test.assert_eq(max32664.rate_set(dut(h), max32664.config_default()), 100)
+    test.assert_eq(at(h.st, 1), 10)
+    h.st.insert(2, 13)
+    test.assert_eq(max32664.rate_set(dut(h), max32664.config_default()), 0)
+
+@test
+fn test_the_leds_have_the_registers_and_the_steps_of_the_max30101() [io, hw]
+    test.assert_eq(max32664.led_reg(PpgLed.PpgRed), 0x0C)
+    test.assert_eq(max32664.led_reg(PpgLed.PpgIr), 0x0D)
+    test.assert_eq(max32664.led_reg(PpgLed.PpgGreen), 0x0E)
+    test.assert_eq(max32664.led_code_of_ma(0), 0)
+    test.assert_eq(max32664.led_code_of_ma(-3), 0)
+    // The guide's trace sets 0x32 for the LEDs: 10 mA.
+    test.assert_eq(max32664.led_code_of_ma(10), 0x32)
+    test.assert_eq(max32664.led_code_of_ma(51), 255)
+    test.assert_eq(max32664.led_code_of_ma(100), 255)
+    test.assert_eq(max32664.ma_of_led_code(0x32), 10)
+    test.assert_eq(max32664.ma_of_led_code(255), 51)
+    let h = hub()
+    test.assert_eq(max32664.led_set(dut(h), PpgLed.PpgIr, 10), 10)
+    log_is(h, [1, 0x40, 0x03, 0x0D, 0x32, -1, 2, 1, -1])
+    h.err.insert(0x4003, 4)
+    test.assert_eq(max32664.led_set(dut(h), PpgLed.PpgRed, 10), 0)
+
+// ── The type over the host's board handles ───────────────────────────
+//
+// The host's I2C bus is absent hardware: every transfer is refused, so each
+// method answers its "no hub" value.  This runs the lines of the type that
+// forward to the functions above.
+
+fn absent(w: DeviceWiring) -> Max32664
+    Max32664.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, w, max32664.config_default())
+
+@test
+fn test_the_type_over_absent_hardware() [io, hw]
+    let p = absent(wiring())
+    test.assert(not p.begin())
+    test.assert(not p.begin_bootloader())
+    test.assert(p.mode() == None)
+    test.assert(p.status() == None)
+    test.assert(p.fifo_count() == None)
+    test.assert(p.report_now() == None)
+    test.assert(p.sample_now() == None)
+    test.assert(p.hub_version() == None)
+    test.assert(p.algo_version() == None)
+    test.assert(p.bootloader_version() == None)
+    test.assert(p.bootloader_page_size() == None)
+    test.assert(not p.exit_bootloader())
+    test.assert(not p.reset())
+    test.assert(not p.stop())
+    test.assert(not p.set_agc(true))
+    test.assert(p.afe_reg(0x07) == None)
+    test.assert(not p.set_afe_reg(0x0D, 0x32))
+    test.assert_eq(p.mfio(), 0)
+    test.assert_eq(p.ppg_set_rate_hz(100), 0)
+    test.assert_eq(p.ppg_set_led_ma(PpgLed.PpgRed, 6), 0)
+    test.assert_eq(p.ppg_lost(), 0)
+    var out: Vec[PpgSample; 32] = Vec.new()
+    test.assert_eq(p.ppg_drain(var out), -1)
+    test.assert(p.device_id() == None)
+
+@test
+fn test_the_port_of_the_type_over_absent_hardware() [io, hw]
+    let p = absent(wiring())
+    var dst: DevBytes = Vec.new()
+    test.assert(not p.read_resp(1, var dst))
+    test.assert(p.now_us() >= 0)
+    test.assert(p.now_ms() >= 0)
+
+@test
+fn test_the_type_without_pins_over_absent_hardware() [io, hw]
+    let p = absent(wiring_no_pins())
+    test.assert(not p.begin())
+    test.assert_eq(p.mfio(), -1)
+
+// A function written against the trait alone, called on a `let`.
+fn drain_all<R: HeartRate>(r: R) -> Int [hw]
+    var out: Vec[PpgSample; 32] = Vec.new()
+    r.ppg_drain(var out)
+
+@test
+fn test_a_function_over_the_trait_reads_the_hub_through_a_plain_parameter() [io, hw]
+    test.assert_eq(drain_all(absent(wiring())), -1)

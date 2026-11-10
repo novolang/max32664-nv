@@ -1,0 +1,875 @@
+// max32664 — Maxim's (now Analog Devices') MAX32664 biometric sensor hub, on
+// its I2C bus, as devices-nv's `HeartRate` and `Identifiable`, with the
+// hub's own heart rate, SpO2 and confidence report beside them.
+//
+// The document is the "MAX32664 User Guide", UG6806; Rev 0; 01/19, which gives
+// the pin sequences that choose the bootloader or the application, the I2C
+// message protocol (Table 5), the status byte (Table 4), the sensor hub status
+// byte (Table 6), the output FIFO format (Table 7) and an annotated trace of a
+// MAX32664GWEA streaming raw and algorithm data (Table 9).  The hub is a
+// MAX32660-class microcontroller with Maxim's firmware on it: in front of a
+// sensor (the MAX30101 on the A variant) it runs an algorithm and the host talks
+// to the firmware, not to the sensor.
+//
+// The protocol.  The 7-bit address is 0x55 (the guide writes 0xAA for a write and
+// 0xAB for a read).  A command is a write of a family byte, an index byte and
+// the data bytes, a wait for the hub to prepare its answer, and a read whose
+// first byte is the status of the command (Table 4: 0 success, 1 unknown family
+// or index, 2 not implemented, 3 wrong byte count, 4 bad value, 5 busy, try
+// again, 0x80 to 0x83 bootloader errors, 0xFF unknown) and whose other bytes are
+// the answer.  The guide gives the wait as 60 microseconds (CMD_DELAY); the
+// later firmware revisions and the drivers read for this one (SparkFun's
+// library, Zephyr's max32664c) wait 2 ms after a command and 45 ms after the
+// commands that enable a sensor or an algorithm, which are what this driver
+// does.  The wait is taken between the two transactions, with a stop after the
+// write.
+//
+// The variants.  The part comes in firmware variants named by the last letter
+// of the part number, each with its own algorithm and report layout, and the
+// bootloader of a part accepts only the matching key.  The letters are not
+// readable from the part.  A (MAX32664GWEA, key A, the MAXREFDES220# reference
+// design): the MaximFast finger heart rate and SpO2 algorithm at 100 Hz with
+// a MAX30101 and an optional KX-122 accelerometer; User Guide Table 1.  Analog
+// Devices' application notes for the other letters are titled "Measuring heart
+// rate using the MAX32664B", "Measuring SpO2 and heart rate using the
+// MAX32664C" and "Measuring blood pressure, heart rate and SpO2 using the
+// MAX32664D": a wrist heart rate algorithm, a wrist heart rate and SpO2
+// algorithm, and blood pressure trending, on the MAX86141 family of sensors.
+// Only A is implemented here; B, C and D are NOT IMPLEMENTED and `config_ok`
+// refuses them.
+//
+// Pitfalls the drivers read carry, and what is done here:
+//
+//   - SparkFun's `readByte` returns the status byte when it is not zero and the
+//     data byte otherwise, so an error code and a value are the same kind of
+//     number.  Here a command answers its status as an `Int` and its data apart.
+//   - SparkFun waits a full second after the reset and Zephyr 1.6 s (its
+//     comment: 50 ms to switch into the mode and 1500 ms of initialisation), while
+//     the guide gives 50 ms.  Here the mode read is polled every 10 ms for up to
+//     1.7 s, so a part that is up earlier is used earlier and a part that never
+//     comes is given up on.
+//   - SparkFun's accelerometer switch tests `!= 0 || != 1`, which is always
+//     true; here every parameter is checked before anything is sent.
+//   - SparkFun reads the answer as a fixed count and trusts the bytes, and
+//     zeroes them on an error.  Here the count the bus returned is checked.
+//   - The status 5 ("try again, the hub is busy") is retried, three times at the
+//     command wait.
+//   - Zephyr's worker reads the whole FIFO in one transaction because, its comment
+//     says, the C variant does not support the read of a single message and an
+//     uncleared FIFO overruns.  The guide says the A variant's read pointer moves
+//     by the sample size read and SparkFun reads one report at a time, so one
+//     sample is read per transaction here, which also keeps each transaction
+//     inside the 31 data bytes of a `DevBytes`.  That the A firmware behaves so
+//     is NOT VERIFIED on a part.
+//   - SparkFun leaves MFIO an output after the bootloader sequence and Zephyr
+//     drives it for sleep; the guide wants it an input once the application
+//     runs, because the hub drives it as the interrupt.  Here it is released.
+//
+// The report layout of the A variant (Table 7), per sample, in the order the
+// output mode names them: the sensor part is the MAX30101's four LEDs, 3 bytes
+// each, 24 bits, most significant first (the guide's trace reads the first as
+// the IR count and the second as red, the third and fourth as the other two LEDs);
+// the algorithm part is the heart rate in 0.1 bpm (2 bytes), the confidence in
+// per cent (1), the SpO2 in 0.1 per cent (2) and the MaximFast state (1): 0 no
+// object, 1 object, 2 object other than a finger, 3 finger.  The extended
+// report of the firmware 10.x adds the SpO2 r value in 0.1 (2 bytes), an extended
+// state (1) and two unused bytes (SparkFun's library, not in the guide).
+
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut, Timer }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_ppg.{ PpgSample, PpgLed, HeartRate }
+use dev_id.{ DeviceId, Identifiable }
+
+// The family and index bytes of Table 5.
+let FAM_STATUS = 0x00
+let FAM_MODE_SET = 0x01
+let FAM_MODE_READ = 0x02
+let FAM_OUTPUT = 0x10
+let FAM_FIFO = 0x12
+let FAM_AFE_WRITE = 0x40
+let FAM_AFE_READ = 0x41
+let FAM_SENSOR_ENABLE = 0x44
+let FAM_ALGO_ENABLE = 0x52
+let FAM_BL_INFO = 0x81
+let FAM_IDENTITY = 0xFF
+
+// The index of the MAX30101 under the register and enable families.
+let IDX_MAX30101 = 0x03
+
+// The delays, in milliseconds: after an ordinary command, after the commands
+// that enable a sensor or an algorithm, between two polls of the mode read.
+let CMD_DELAY_MS = 2
+let ENABLE_DELAY_MS = 45
+let POLL_MS = 10
+
+// The pin sequences of the User Guide: RSTN low for 10 ms with MFIO at the level
+// of the mode, then RSTN high and 50 ms; and how long the hub is given to answer
+// after that (the application initialises for up to 1.5 s; the bootloader
+// answers sooner).
+let RESET_MS = 10
+let BOOT_MS = 50
+let APP_WAIT_MS = 1700
+let BL_WAIT_MS = 200
+
+// The status byte of a command that was taken (Table 4).
+pub const STATUS_OK = 0
+
+// The status byte of a hub that is busy and wants the command again.
+pub const STATUS_BUSY = 5
+
+// How many times a command that answers "busy" is sent.
+let TRIES = 3
+
+// The bus clock.  The hub supports up to 3.4 Mbit/s; the driver asks 400 kHz.
+let I2C_HZ = 400000
+
+// The device mode of the application (family 0x02).
+pub const MODE_APP = 0x00
+
+// The device mode of the bootloader (family 0x02).
+pub const MODE_BOOTLOADER = 0x08
+
+// The bytes of a sample: four LEDs of three bytes; the algorithm report; the
+// extended algorithm report.
+let LED_BYTES = 12
+let ALGO_BYTES = 6
+let ALGO_EXT_BYTES = 11
+
+// The FIFO is read by this driver to 32 samples.
+let DRAIN_MAX = 32
+
+// The time between two samples at the 100 Hz the A firmware runs, in
+// microseconds.
+pub const SAMPLE_PERIOD_US = 10000
+
+// The firmware samples at 100 Hz, whatever rate a caller asks.
+pub const RATE_HZ = 100
+
+// The MAX30101's LED pulse amplitude registers and step (0.2 mA, 0xFF = 51 mA).
+let REG_LED1_PA = 0x0C
+let REG_LED2_PA = 0x0D
+let REG_LED3_PA = 0x0E
+let LED_CODE_MAX = 255
+
+// The firmware variants.
+pub @value
+enum Max32664Variant
+    VariantA
+    VariantB
+    VariantC
+    VariantD
+
+// What a program says about the hub.  `output` is the hub's output mode: 1
+// sensor data, 2 algorithm data, 3 both (the other modes pause the FIFO, or
+// add a counter byte whose place in the sample the guide does not give).
+// `algo_mode` is 0 for no algorithm, 1 for the report of Table 7, 2 for the
+// extended report.  `threshold` is the FIFO level at which the hub raises
+// DataRdyInt on MFIO, 1 to 255 samples.  `agc` is whether the algorithm's
+// automatic gain control sets the LED currents (and the pulse width).
+pub @value
+struct Max32664Config
+    variant: Max32664Variant
+    output: Int
+    algo_mode: Int
+    threshold: Int
+    agc: Bool
+
+// A version as the hub gives it: major, minor, revision.
+pub @value
+struct HubVersion
+    major: Int
+    minor: Int
+    rev: Int
+
+// The algorithm report of one sample.  `heart_rate_x10` is the heart rate in
+// 0.1 bpm, `confidence` in per cent, `spo2_x10` in 0.1 per cent, `state` the
+// MaximFast state (0 no object, 1 object, 2 other object, 3 finger).  `r_x10`
+// and `ext_state` are the extended report's SpO2 r value in 0.1 and extended
+// state, 0 in the plain one.
+pub @value
+struct Max32664Report
+    heart_rate_x10: Int
+    confidence: Int
+    spo2_x10: Int
+    state: Int
+    r_x10: Int
+    ext_state: Int
+
+// One sample of the FIFO: the four LED counts and the report.  `leds` is
+// the count of the first, second, third and fourth LED field, as the guide's
+// trace names them (IR, red, the other two); `report` is `None` when the
+// output mode has no algorithm data.
+pub @value
+struct Max32664Sample
+    led1: Int
+    led2: Int
+    led3: Int
+    led4: Int
+    report: ?Max32664Report
+
+// A bus the hub is on: `setup` makes it ready, `write_cmd` sends a command frame
+// (the family byte, then the bytes of `src`) in one transaction, `read_resp`
+// reads `n` bytes in one, `now_ms` and `wait_ms` are the clock, `rstn` drives the
+// reset pin, `mfio_out` makes MFIO an output at a level, `mfio_in` makes it an
+// input with a pull-up, and `mfio_level` reads it.
+pub trait Max32664Port
+    fn setup(self) -> Bool [hw]
+    fn write_cmd(self, family: Int, src: DevBytes) -> Bool [hw]
+    fn read_resp(self, n: Int, var dst: DevBytes) -> Bool [hw]
+    fn now_ms(self) -> Int [hw]
+    fn now_us(self) -> Int [hw]
+    fn wait_ms(self, ms: Int) [hw]
+    fn rstn(self, level: Int) -> Bool [hw]
+    fn mfio_out(self, level: Int) -> Bool [hw]
+    fn mfio_in(self) -> Bool [hw]
+    fn mfio_level(self) -> Int [hw]
+
+// ── The bus and the pins ─────────────────────────────────────────────
+
+// Writes a command frame: the family byte, then `src`, to the hub's address.
+pub fn i2c_write_cmd<B: I2cBus>(bus: B, w: DeviceWiring, family: Int, src: DevBytes) -> Bool [hw]
+    dev_bus.wiring_write_from(bus, w, family, src)
+
+// Reads `n` bytes from the hub, the status first, with no register: whether
+// the hub answered with that many.  `dst` is emptied first.
+pub fn i2c_read_resp<B: I2cBus>(bus: B, w: DeviceWiring, n: Int, var dst: DevBytes) -> Bool [hw]
+    dst.clear()
+    let Some(addr) = w.addr else return false
+    if n > dst.capacity()
+        return false
+    match bus.read(addr, n)
+        Some(b) =>
+            if b.len() != n
+                return false
+            for x in b
+                let _ = dst.push(x)
+            true
+        None => false
+
+// Makes the bus ready, at 400 kHz.  Answers whether the wiring has an address.
+pub fn i2c_setup<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    bus.init(I2C_HZ)
+    w.addr != None
+
+// Drives RSTN (the wiring's `en`) as an output: whether the wiring has the pin.
+pub fn rstn_of<G: GpioOut>(gpio: G, w: DeviceWiring, level: Int) -> Bool [hw]
+    let Some(pin) = w.en else return false
+    gpio.mode(pin, 1)
+    gpio.set(pin, level)
+    true
+
+// Drives MFIO (the wiring's `irq`) as an output: whether the wiring has the pin.
+pub fn mfio_out_of<G: GpioOut>(gpio: G, w: DeviceWiring, level: Int) -> Bool [hw]
+    let Some(pin) = w.irq else return false
+    gpio.mode(pin, 1)
+    gpio.set(pin, level)
+    true
+
+// Makes MFIO an input with a pull-up, the interrupt line of the running
+// application: whether the wiring has the pin.
+pub fn mfio_in_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Bool [hw]
+    let Some(pin) = w.irq else return false
+    gpio.mode(pin, 2)
+    true
+
+// The level of MFIO, or -1 for a wiring with no MFIO pin.
+pub fn mfio_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    let Some(pin) = w.irq else return -1
+    gpio.get(pin)
+
+// ── Commands ─────────────────────────────────────────────────────────
+
+// One command: the family and index bytes and the bytes of `data`, a wait of
+// `delay_ms`, then the status byte and `n` bytes of answer.  Answers the status
+// (0 success, see Table 4), or -1 when the bus failed; the answer bytes are in
+// `out` only for status 0.  A status of 5 (busy) sends the command again, up to
+// three times in all.
+pub fn xfer<P: Max32664Port>(p: P, family: Int, index: Int, data: DevBytes, n: Int,
+                             delay_ms: Int, var out: DevBytes) -> Int [hw]
+    out.clear()
+    if n < 0 or n > 31
+        return -1
+    var status = -1
+    var again = true
+    for _try in 0..TRIES
+        if again
+            again = false
+            var src: DevBytes = Vec.new()
+            let _ = src.push(index as u8)
+            for x in data
+                let _ = src.push(x)
+            status = -1
+            if p.write_cmd(family, src)
+                p.wait_ms(delay_ms)
+                var resp: DevBytes = Vec.new()
+                if p.read_resp(n + 1, var resp)
+                    status = resp[0] as Int
+                    if status == STATUS_OK
+                        for i in 0..n
+                            let _ = out.push(resp[i + 1])
+                    if status == STATUS_BUSY
+                        again = true
+    status
+
+// A command with one data byte and no answer: whether the hub took it.
+pub fn cmd1<P: Max32664Port>(p: P, family: Int, index: Int, byte: Int, delay_ms: Int) -> Bool [hw]
+    var data: DevBytes = Vec.new()
+    let _ = data.push((byte & 0xFF) as u8)
+    var out: DevBytes = Vec.new()
+    xfer(p, family, index, data, 0, delay_ms, var out) == STATUS_OK
+
+// A command with two data bytes and no answer.
+pub fn cmd2<P: Max32664Port>(p: P, family: Int, index: Int, b0: Int, b1: Int, delay_ms: Int) -> Bool [hw]
+    var data: DevBytes = Vec.new()
+    let _ = data.push((b0 & 0xFF) as u8)
+    let _ = data.push((b1 & 0xFF) as u8)
+    var out: DevBytes = Vec.new()
+    xfer(p, family, index, data, 0, delay_ms, var out) == STATUS_OK
+
+// A read command with no data bytes: whether the hub answered, with the
+// `n` bytes in `out`.
+pub fn read_cmd<P: Max32664Port>(p: P, family: Int, index: Int, n: Int, var out: DevBytes) -> Bool [hw]
+    let data: DevBytes = Vec.new()
+    xfer(p, family, index, data, n, CMD_DELAY_MS, var out) == STATUS_OK
+
+// ── The hub ──────────────────────────────────────────────────────────
+
+// The sensor hub status byte (Table 6): bit 0 Err0 (a sensor communication
+// problem), bit 3 DataRdyInt (the FIFO is at its threshold), bit 4 FifoOutOvrInt
+// (the output FIFO overflowed), bit 5 FifoInOvrInt, bit 6 DevBusy.  `None` when
+// the hub did not answer.
+pub fn status_read<P: Max32664Port>(p: P) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not read_cmd(p, FAM_STATUS, 0x00, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// Whether a status byte has the FIFO at its threshold.
+pub fn status_data_ready(s: Int) -> Bool
+    (s & 0x08) != 0
+
+// Whether a status byte reports an overflow of the output FIFO.
+pub fn status_fifo_overflow(s: Int) -> Bool
+    (s & 0x10) != 0
+
+// Whether a status byte reports the hub busy.
+pub fn status_busy(s: Int) -> Bool
+    (s & 0x40) != 0
+
+// Whether a status byte reports a problem talking to the sensor.
+pub fn status_sensor_error(s: Int) -> Bool
+    (s & 0x01) != 0
+
+// The device mode: 0 application, 8 bootloader; `None` when the hub did not
+// answer.
+pub fn mode_read<P: Max32664Port>(p: P) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not read_cmd(p, FAM_MODE_READ, 0x00, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// Selects the device mode by command: 0 exits the bootloader, 2 resets, 8
+// enters the bootloader.  Answers whether the hub took it.
+pub fn mode_set<P: Max32664Port>(p: P, v: Int) -> Bool [hw]
+    if v != 0 and v != 2 and v != 8
+        return false
+    cmd1(p, FAM_MODE_SET, 0x00, v, CMD_DELAY_MS)
+
+// Reads a three-byte version at a family and index.
+pub fn version_of<P: Max32664Port>(p: P, family: Int, index: Int) -> ?HubVersion [hw]
+    var b: DevBytes = Vec.new()
+    if not read_cmd(p, family, index, 3, var b)
+        return None
+    Some(HubVersion { major: b[0] as Int, minor: b[1] as Int, rev: b[2] as Int })
+
+// The sensor hub (firmware) version, family 0xFF index 0x03.
+pub fn hub_version<P: Max32664Port>(p: P) -> ?HubVersion [hw]
+    version_of(p, FAM_IDENTITY, 0x03)
+
+// The algorithm version, family 0xFF index 0x07.
+pub fn algo_version<P: Max32664Port>(p: P) -> ?HubVersion [hw]
+    version_of(p, FAM_IDENTITY, 0x07)
+
+// The bootloader version, family 0x81 index 0x00; answers while the hub is in
+// bootloader mode.
+pub fn bootloader_version<P: Max32664Port>(p: P) -> ?HubVersion [hw]
+    version_of(p, FAM_BL_INFO, 0x00)
+
+// The bootloader page size in bytes, family 0x81 index 0x01 (8192 in the
+// guide's trace).
+pub fn bootloader_page_size<P: Max32664Port>(p: P) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not read_cmd(p, FAM_BL_INFO, 0x01, 2, var b)
+        return None
+    Some((b[0] as Int << 8) | b[1] as Int)
+
+// The microcontroller type: 0 MAX32625, 1 MAX32660 or MAX32664.
+pub fn mcu_type<P: Max32664Port>(p: P) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not read_cmd(p, FAM_IDENTITY, 0x00, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// The hub's identity: the microcontroller type as `who` and the algorithm's
+// major version as `rev`; the hub has no register for an ID.
+pub fn id_read<P: Max32664Port>(p: P) -> ?DeviceId [hw]
+    let Some(t) = mcu_type(p) else return None
+    if t != 1
+        return None
+    var rev: ?Int = None
+    if let Some(v) = hub_version(p)
+        rev = Some(v.major)
+    Some(DeviceId { who: t, rev: rev })
+
+// ── The pins that choose the mode ────────────────────────────────────
+
+// Polls the mode read every 10 ms for up to `wait_ms`, until it answers: whether
+// the hub answered with the mode `want`.  A read the hub does not answer (it
+// NACKs while it starts) is tried again; an answer with another mode ends the
+// wait.
+pub fn mode_wait<P: Max32664Port>(p: P, want: Int, wait_ms: Int) -> Bool [hw]
+    let start = p.now_ms()
+    loop
+        if let Some(m) = mode_read(p)
+            return m == want
+        if p.now_ms() - start >= wait_ms
+            return false
+        p.wait_ms(POLL_MS)
+
+// The pin sequence of the guide for a mode: RSTN low for 10 ms, MFIO at `mfio`
+// (high for the application, low for the bootloader) while it is low, RSTN high,
+// 50 ms.  Answers whether the wiring has both pins.
+pub fn reset_into<P: Max32664Port>(p: P, mfio: Int) -> Bool [hw]
+    if not p.rstn(0)
+        return false
+    if not p.mfio_out(mfio)
+        return false
+    p.wait_ms(RESET_MS)
+    let _up = p.rstn(1)
+    p.wait_ms(BOOT_MS)
+    true
+
+// Resets the hub into the application: the sequence, then MFIO released as an
+// input for the interrupt, then the wait for the hub to answer in application
+// mode.
+pub fn enter_app_mode<P: Max32664Port>(p: P) -> Bool [hw]
+    if not reset_into(p, 1)
+        return false
+    let _in = p.mfio_in()
+    mode_wait(p, MODE_APP, APP_WAIT_MS)
+
+// Resets the hub into the bootloader: the sequence with MFIO low, then the wait
+// for the hub to answer in bootloader mode.  MFIO stays an output, low.  The
+// bootloader's flashing is NOT IMPLEMENTED; in this mode the driver can read
+// the versions and leave it.
+pub fn enter_bootloader<P: Max32664Port>(p: P) -> Bool [hw]
+    if not reset_into(p, 0)
+        return false
+    mode_wait(p, MODE_BOOTLOADER, BL_WAIT_MS)
+
+// ── The configuration ────────────────────────────────────────────────
+
+// The A variant's configuration the guide's trace uses: sensor and algorithm
+// data, the plain report, an interrupt when 15 samples wait, the automatic gain
+// control on.
+pub fn config_default() -> Max32664Config
+    Max32664Config { variant: Max32664Variant.VariantA, output: 3, algo_mode: 1, threshold: 15, agc: true }
+
+// Whether the driver can run the configuration: the A variant, an output mode of
+// sensor data, algorithm data or both, an algorithm mode of 0 to 2 that is not 0
+// when the output carries algorithm data, and a threshold of 1 to 255.
+pub fn config_ok(c: Max32664Config) -> Bool
+    if c.variant != Max32664Variant.VariantA
+        return false
+    if c.output < 1 or c.output > 3
+        return false
+    if c.algo_mode < 0 or c.algo_mode > 2
+        return false
+    if (c.output & 2) != 0 and c.algo_mode == 0
+        return false
+    c.threshold >= 1 and c.threshold <= 255
+
+// The bytes of one FIFO sample for a configuration: the four LEDs when the output
+// carries sensor data, the report when it carries algorithm data.
+pub fn sample_bytes(c: Max32664Config) -> Int
+    var n = 0
+    if (c.output & 1) != 0
+        n = n + LED_BYTES
+    if (c.output & 2) != 0
+        if c.algo_mode == 2
+            n = n + ALGO_EXT_BYTES
+        else
+            n = n + ALGO_BYTES
+    n
+
+// Sets the output mode (family 0x10 index 0x00): 1 to 3.  The counter-byte modes
+// 5 to 7 are NOT IMPLEMENTED, because the guide does not say where the counter
+// sits in the sample.  Answers whether the hub took it.
+pub fn output_mode_set<P: Max32664Port>(p: P, mode: Int) -> Bool [hw]
+    if mode < 0 or mode > 4
+        return false
+    cmd1(p, FAM_OUTPUT, 0x00, mode, CMD_DELAY_MS)
+
+// Sets the FIFO threshold (family 0x10 index 0x01), 1 to 255 samples.
+pub fn threshold_set<P: Max32664Port>(p: P, n: Int) -> Bool [hw]
+    if n < 1 or n > 255
+        return false
+    cmd1(p, FAM_OUTPUT, 0x01, n, CMD_DELAY_MS)
+
+// Enables or disables the MAX30101 (family 0x44 index 0x03).  The hub takes up
+// to 45 ms.
+pub fn afe_enable<P: Max32664Port>(p: P, on: Bool) -> Bool [hw]
+    var v = 0
+    if on
+        v = 1
+    cmd1(p, FAM_SENSOR_ENABLE, IDX_MAX30101, v, ENABLE_DELAY_MS)
+
+// Enables or disables the automatic gain control (family 0x52 index 0x00).
+pub fn agc_enable<P: Max32664Port>(p: P, on: Bool) -> Bool [hw]
+    var v = 0
+    if on
+        v = 1
+    cmd1(p, FAM_ALGO_ENABLE, 0x00, v, ENABLE_DELAY_MS)
+
+// Sets the WHRM/MaximFast algorithm (family 0x52 index 0x02): 0 off, 1 on, 2 on
+// with the extended report.
+pub fn algo_enable<P: Max32664Port>(p: P, mode: Int) -> Bool [hw]
+    if mode < 0 or mode > 2
+        return false
+    cmd1(p, FAM_ALGO_ENABLE, 0x02, mode, ENABLE_DELAY_MS)
+
+// Reads a register of the MAX30101 through the hub (family 0x41 index 0x03).
+pub fn afe_reg_read<P: Max32664Port>(p: P, reg: Int) -> ?Int [hw]
+    var data: DevBytes = Vec.new()
+    let _ = data.push((reg & 0xFF) as u8)
+    var out: DevBytes = Vec.new()
+    if xfer(p, FAM_AFE_READ, IDX_MAX30101, data, 1, CMD_DELAY_MS, var out) != STATUS_OK
+        return None
+    Some(out[0] as Int)
+
+// Writes a register of the MAX30101 through the hub (family 0x40 index 0x03).
+pub fn afe_reg_write<P: Max32664Port>(p: P, reg: Int, v: Int) -> Bool [hw]
+    cmd2(p, FAM_AFE_WRITE, IDX_MAX30101, reg, v, CMD_DELAY_MS)
+
+// Starts sampling in the order of the guide's trace (Table 9): the output mode,
+// the FIFO threshold, the sensor, then the algorithm; with the automatic gain
+// control switched first, as SparkFun's library does.  The hub's sample rate is
+// fixed by its firmware, 100 Hz.  Answers whether the hub took every command.
+pub fn sampling_start<P: Max32664Port>(p: P, c: Max32664Config) -> Bool [hw]
+    if not config_ok(c)
+        return false
+    if not (output_mode_set(p, c.output) and threshold_set(p, c.threshold))
+        return false
+    if not agc_enable(p, c.agc)
+        return false
+    if not afe_enable(p, true)
+        return false
+    algo_enable(p, c.algo_mode)
+
+// Stops sampling: the algorithm off, the sensor off, the output paused.
+pub fn sampling_stop<P: Max32664Port>(p: P) -> Bool [hw]
+    let a = algo_enable(p, 0)
+    let s = afe_enable(p, false)
+    let o = output_mode_set(p, 0)
+    a and s and o
+
+// Brings the hub up: the bus made ready, the hub reset into the application and
+// waited for, and sampling started.  Answers whether the hub came up and took
+// every command.
+pub fn bring_up<P: Max32664Port>(p: P, c: Max32664Config) -> Bool [hw]
+    if not config_ok(c)
+        return false
+    if not p.setup()
+        return false
+    if not enter_app_mode(p)
+        return false
+    sampling_start(p, c)
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+
+// The samples waiting in the output FIFO (family 0x12 index 0x00), `None` when
+// the hub did not answer.
+pub fn samples_available<P: Max32664Port>(p: P) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not read_cmd(p, FAM_FIFO, 0x00, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// A 24-bit count from three bytes, most significant first, at `off`.
+pub fn count24(b: DevBytes, off: Int) -> Int
+    ((b[off] as Int) << 16) | ((b[off + 1] as Int) << 8) | (b[off + 2] as Int)
+
+// A 16-bit value from two bytes, most significant first, at `off`.
+pub fn word16(b: DevBytes, off: Int) -> Int
+    ((b[off] as Int) << 8) | (b[off + 1] as Int)
+
+// The algorithm report in `b` at `off`; `ext` for the extended layout.
+pub fn report_of(b: DevBytes, off: Int, ext: Bool) -> Max32664Report
+    var r = 0
+    var es = 0
+    if ext
+        r = word16(b, off + 6)
+        es = b[off + 8] as Int
+    Max32664Report { heart_rate_x10: word16(b, off), confidence: b[off + 2] as Int,
+                     spo2_x10: word16(b, off + 3), state: b[off + 5] as Int,
+                     r_x10: r, ext_state: es }
+
+// One sample from the bytes of the FIFO for a configuration.
+pub fn sample_of(b: DevBytes, c: Max32664Config) -> Max32664Sample
+    var off = 0
+    var l1 = 0
+    var l2 = 0
+    var l3 = 0
+    var l4 = 0
+    if (c.output & 1) != 0
+        l1 = count24(b, 0)
+        l2 = count24(b, 3)
+        l3 = count24(b, 6)
+        l4 = count24(b, 9)
+        off = LED_BYTES
+    if (c.output & 2) != 0
+        return Max32664Sample { led1: l1, led2: l2, led3: l3, led4: l4,
+                                report: Some(report_of(b, off, c.algo_mode == 2)) }
+    Max32664Sample { led1: l1, led2: l2, led3: l3, led4: l4, report: None }
+
+// Reads one sample from the FIFO (family 0x12 index 0x01), the oldest, and
+// moves the hub's read pointer past it: `None` when the hub did not answer.  A
+// read with the FIFO empty is a program's error the hub answers with zeros or
+// an error; the caller checks `samples_available` first.
+pub fn sample_read<P: Max32664Port>(p: P, c: Max32664Config) -> ?Max32664Sample [hw]
+    var b: DevBytes = Vec.new()
+    if not read_cmd(p, FAM_FIFO, 0x01, sample_bytes(c), var b)
+        return None
+    Some(sample_of(b, c))
+
+// The next algorithm report, or `None` when the hub did not answer or the
+// configuration has no algorithm data.  An empty FIFO answers `Some` of a report
+// the hub fills with whatever it holds; ask `samples_available` first.
+pub fn report_read<P: Max32664Port>(p: P, c: Max32664Config) -> ?Max32664Report [hw]
+    if (c.output & 2) == 0
+        return None
+    let Some(s) = sample_read(p, c) else return None
+    s.report
+
+// Whether a report is a reading a program can use: the MaximFast state says a
+// finger is on the sensor (3) and the confidence is at least `min_conf` per cent.
+pub fn report_good(r: Max32664Report, min_conf: Int) -> Bool
+    r.state == 3 and r.confidence >= min_conf
+
+// Drains the FIFO into `out` as PPG samples: the samples waiting, up to 32, one
+// transaction each, oldest first.  The LED fields are the PPG sample's: the
+// second (red in the guide's trace) as `red`, the first (IR) as `ir`, the third
+// as `green`.  Answers how many were read, 0 when the FIFO is empty or the output
+// carries no sensor data (the algorithm reports stay in the FIFO for
+// `report_read`), and -1 when the hub did not answer; a failed read part-way
+// leaves the samples before it read and gone from the hub's FIFO, and `out`
+// empty.  The part carries no time stamps: the newest sample is stamped with the
+// board's microsecond tick and each older one 10 ms before the next.
+pub fn drain<P: Max32664Port>(p: P, c: Max32664Config, var out: Vec[PpgSample; 32]) -> Int [hw]
+    out.clear()
+    if (c.output & 1) == 0
+        return 0
+    let Some(avail) = samples_available(p) else return -1
+    var n = avail
+    if n > DRAIN_MAX
+        n = DRAIN_MAX
+    if n == 0
+        return 0
+    let now = p.now_us()
+    for k in 0..n
+        match sample_read(p, c)
+            Some(s) =>
+                let _ = out.push(PpgSample { red: s.led2, ir: s.led1, green: Some(s.led3),
+                                             at_us: now - (n - 1 - k) * SAMPLE_PERIOD_US })
+            None =>
+                out.clear()
+                return -1
+    n
+
+// Whether the hub reports an overflow of its output FIFO: 1 when the sensor hub
+// status byte has FifoOutOvrInt set, 0 when it does not or the hub did not
+// answer.  The hub gives a flag, not a count.
+pub fn lost<P: Max32664Port>(p: P) -> Int [hw]
+    let Some(s) = status_read(p) else return 0
+    if status_fifo_overflow(s)
+        return 1
+    0
+
+// Starts sampling with the configuration and answers the rate: 100 Hz, the one
+// rate of the firmware, or 0 when the hub did not take every command.
+pub fn rate_set<P: Max32664Port>(p: P, c: Max32664Config) -> Int [hw]
+    if sampling_start(p, c)
+        return RATE_HZ
+    0
+
+// The register of the MAX30101 that sets an LED's pulse amplitude.
+pub fn led_reg(led: PpgLed) -> Int
+    match led
+        PpgLed.PpgRed => REG_LED1_PA
+        PpgLed.PpgIr => REG_LED2_PA
+        PpgLed.PpgGreen => REG_LED3_PA
+
+// The pulse-amplitude code for a current in milliamps: the largest step at or
+// below it, 0.2 mA a step, never above, 0 for a current that is not positive.
+pub fn led_code_of_ma(ma: Int) -> Int
+    if ma <= 0
+        return 0
+    let c = ma * 10 / 2
+    if c > LED_CODE_MAX
+        return LED_CODE_MAX
+    c
+
+// The current a code sets, in whole milliamps, rounded down.
+pub fn ma_of_led_code(code: Int) -> Int
+    (code & 0xFF) * 2 / 10
+
+// Sets an LED's current through the hub's register write: the current set in
+// whole milliamps, 0 when the hub did not take it.  With the automatic gain
+// control on, the algorithm rewrites the currents; `agc_enable(p, false)` first.
+pub fn led_set<P: Max32664Port>(p: P, led: PpgLed, ma: Int) -> Int [hw]
+    let code = led_code_of_ma(ma)
+    if not afe_reg_write(p, led_reg(led), code)
+        return 0
+    ma_of_led_code(code)
+
+// ── The hub on a board's I2C bus ─────────────────────────────────────
+
+// A MAX32664 on a board's I2C bus at the address `w.addr`, 0x55, with the board's
+// timer for the stamps and the board's GPIO for the two pins: RSTN is the
+// wiring's `en` and MFIO its `irq`.  The configuration is what `begin` applies
+// and what the reads decode by.
+pub @value
+struct Max32664
+    bus: BoardI2c
+    timer: BoardTimer
+    pins: BoardGpio
+    w: DeviceWiring
+    cfg: Max32664Config
+
+impl Max32664Port for Max32664
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.w)
+
+    fn write_cmd(self, family: Int, src: DevBytes) -> Bool [hw]
+        i2c_write_cmd(self.bus, self.w, family, src)
+
+    fn read_resp(self, n: Int, var dst: DevBytes) -> Bool [hw]
+        i2c_read_resp(self.bus, self.w, n, var dst)
+
+    fn now_ms(self) -> Int [hw]
+        self.timer.ticks_ms()
+
+    fn now_us(self) -> Int [hw]
+        self.timer.ticks_us()
+
+    fn wait_ms(self, ms: Int) [hw]
+        self.timer.delay_ms(ms)
+
+    fn rstn(self, level: Int) -> Bool [hw]
+        rstn_of(self.pins, self.w, level)
+
+    fn mfio_out(self, level: Int) -> Bool [hw]
+        mfio_out_of(self.pins, self.w, level)
+
+    fn mfio_in(self) -> Bool [hw]
+        mfio_in_of(self.pins, self.w)
+
+    fn mfio_level(self) -> Int [hw]
+        mfio_level_of(self.pins, self.w)
+
+impl Max32664
+    // The hub at `w.addr` on the board's I2C bus, as a board's device table builds
+    // it.  Nothing is sent.
+    fn attach(bus: BoardI2c, timer: BoardTimer, pins: BoardGpio, w: DeviceWiring,
+              cfg: Max32664Config) -> Max32664
+        Max32664 { bus: bus, timer: timer, pins: pins, w: w, cfg: cfg }
+
+    // Resets the hub into the application and starts sampling with the
+    // configuration (`bring_up`).  Takes up to 1.7 s.  Answers whether it came up.
+    fn begin(self) -> Bool [hw]
+        bring_up(self, self.cfg)
+
+    // Resets the hub into the bootloader mode and answers whether it came up there.
+    fn begin_bootloader(self) -> Bool [hw]
+        enter_bootloader(self)
+
+    // The device mode: 0 application, 8 bootloader.
+    fn mode(self) -> ?Int [hw]
+        mode_read(self)
+
+    // The sensor hub status byte, `None` when the hub did not answer.
+    fn status(self) -> ?Int [hw]
+        status_read(self)
+
+    // The samples waiting in the FIFO.
+    fn fifo_count(self) -> ?Int [hw]
+        samples_available(self)
+
+    // The next algorithm report, oldest first.
+    fn report_now(self) -> ?Max32664Report [hw]
+        report_read(self, self.cfg)
+
+    // The next whole sample, oldest first.
+    fn sample_now(self) -> ?Max32664Sample [hw]
+        sample_read(self, self.cfg)
+
+    // The hub (firmware) version, the algorithm version, the bootloader version
+    // and page size.
+    fn hub_version(self) -> ?HubVersion [hw]
+        hub_version(self)
+
+    fn algo_version(self) -> ?HubVersion [hw]
+        algo_version(self)
+
+    fn bootloader_version(self) -> ?HubVersion [hw]
+        bootloader_version(self)
+
+    fn bootloader_page_size(self) -> ?Int [hw]
+        bootloader_page_size(self)
+
+    // Leaves the bootloader for the application by the mode command.
+    fn exit_bootloader(self) -> Bool [hw]
+        mode_set(self, 0)
+
+    // Resets the hub by the mode command.
+    fn reset(self) -> Bool [hw]
+        mode_set(self, 2)
+
+    // Stops sampling.
+    fn stop(self) -> Bool [hw]
+        sampling_stop(self)
+
+    // The automatic gain control on or off.
+    fn set_agc(self, on: Bool) -> Bool [hw]
+        agc_enable(self, on)
+
+    // One register of the MAX30101 through the hub, and a write.
+    fn afe_reg(self, r: Int) -> ?Int [hw]
+        afe_reg_read(self, r)
+
+    fn set_afe_reg(self, r: Int, v: Int) -> Bool [hw]
+        afe_reg_write(self, r, v)
+
+    // The level of MFIO, -1 without a pin in the wiring.
+    fn mfio(self) -> Int [hw]
+        self.mfio_level()
+
+impl HeartRate[hw] for Max32664
+    // Starts sampling with the configuration and answers the rate, 100 Hz: the
+    // firmware has one rate, whatever `hz` is, and 0 when the hub did not take it.
+    fn ppg_set_rate_hz(self, hz: Int) -> Int [hw]
+        rate_set(self, self.cfg)
+
+    fn ppg_set_led_ma(self, led: PpgLed, ma: Int) -> Int [hw]
+        led_set(self, led, ma)
+
+    fn ppg_drain(self, var out: Vec[PpgSample; 32]) -> Int [hw]
+        drain(self, self.cfg, var out)
+
+    fn ppg_lost(self) -> Int [hw]
+        lost(self)
+
+impl Identifiable[hw] for Max32664
+    // The microcontroller type, 1, and the major version of the hub firmware.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self)

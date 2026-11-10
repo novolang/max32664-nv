@@ -1,0 +1,28 @@
+[package]
+name        = "max32664-nv"
+version     = "0.1.0"
+description = "A driver for the Maxim (Analog Devices) MAX32664 biometric sensor hub, the A variant with a MAX30101, on an I2C bus: the family and index command protocol with its status byte and 2 ms and 45 ms delays, the RSTN and MFIO sequences into application and bootloader mode, the hub, algorithm and bootloader versions, the output mode and FIFO threshold, the sensor and MaximFast algorithm enables, and the FIFO of raw LED counts with heart rate, confidence, SpO2 and state, as devices-nv's HeartRate and Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["max32664", "max30101", "sensor-hub", "biometric", "pulse-oximeter", "heart-rate", "spo2", "maximfast", "i2c", "sensor", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/max32664-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+# The package is checked at the embedded tier, the strictest one, so
+# every function in it is also valid at rt and system.
+[tier]
+tier = "embedded"
+
+[docs.pages]
+"README.md" = "Reading heart rate and SpO2 from a MAX32664 sensor hub in a device program"
+
+[dependencies]
+# The board's I2C bus, GPIO and timer handles, and the I2cBus, GpioOut
+# and Timer traits they implement.
+embedded-hal-nv = "^0.3.2"
+# The HeartRate and Identifiable traits, the wiring record a board's
+# device table hands `attach`, and the register helpers.
+devices-nv      = { path = "../devices-nv" }

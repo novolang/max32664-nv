@@ -1,0 +1,96 @@
+/* hr_reader.nv: a reading loop that prints the heart rate, SpO2 and confidence
+ * a MAX32664 sensor hub reports, once a second
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          max32664-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The part is a MAX32664GWEA (the A variant, MaximFast firmware) in front of a
+ * MAX30101, as on the SparkFun SEN-15219 breakout and the MAXREFDES220#: SDA and
+ * SCL to the board's first I2C bus, power to 3.3 V and ground, RSTN to the
+ * board's pin 28 and MFIO to pin 29.  The hub answers at 0x55.  A finger on
+ * the sensor gives lines like
+ *
+ *     hr 63.0 bpm  confidence 99  spo2 99.6  state 3
+ *
+ * and the state is the MaximFast state: 0 no object, 1 object, 2 object other
+ * than a finger, 3 finger.  The hub needs a few seconds with a finger on it
+ * before the heart rate settles; the confidence says when.
+ *
+ * The program asks the hub for its algorithm report only (output mode 2) with
+ * the automatic gain control on, so the hub sets the LED currents.  `begin`
+ * resets the hub into its application with the RSTN and MFIO sequence of the
+ * User Guide, waits for it to answer (up to 1.7 s), and starts the sensor and
+ * the algorithm.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the two pins, the UART
+ * and the timer.  It allocates nothing after it starts.
+ *
+ * Boards: the nRF52840 DK and the nRF54LM20 DK build this program, but
+ * neither board has a driver for its two-wire interface yet (TWIM), so
+ * `BoardI2c` is absent hardware there and the program prints "no answer"
+ * until a board package names one with `@hal(i2c)`.  No board on the bench
+ * carries the hub; it has not been read on a board.
+ */
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer }
+use dev_bus
+use max32664.{ Max32664, Max32664Config, Max32664Variant, Max32664Report }
+
+// Writes `n`, 0 or more, in decimal.  Formatting into a string would
+// allocate, which @tier(embedded) refuses, so each digit goes out as a
+// byte.  An Int has at most 19 decimal digits, which bounds both loops.
+@tier(embedded)
+fn digits(n: Int) [hw]
+    var div = 1
+    for _k in 0..18
+        if div <= n / 10
+            div = div * 10
+    for _k in 0..19
+        if div > 0
+            hal.uart.write_byte(48 + (n / div) % 10)
+            div = div / 10
+
+// Writes a value in tenths as a decimal with one place: 630 is 63.0.
+@tier(embedded)
+fn tenths(n: Int) [hw]
+    digits(n / 10)
+    hal.uart.write_byte(46)
+    digits(n % 10)
+
+// Writes the line for a report.
+@tier(embedded)
+fn report(r: Max32664Report) [hw]
+    hal.uart.write("hr ")
+    tenths(r.heart_rate_x10)
+    hal.uart.write(" bpm  confidence ")
+    digits(r.confidence)
+    hal.uart.write("  spo2 ")
+    tenths(r.spo2_x10)
+    hal.uart.write("  state ")
+    digits(r.state)
+    hal.uart.write("\n")
+
+@tier(embedded)
+fn main() [hw]
+    bsp.board.init()
+    // The algorithm report only, the plain layout, an interrupt at one sample,
+    // the automatic gain control on.
+    let cfg = Max32664Config { variant: Max32664Variant.VariantA, output: 2, algo_mode: 1, threshold: 1, agc: true }
+    let w = dev_bus.wiring_en(dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x55), 29), 28)
+    let hub = Max32664.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, w, cfg)
+    if not hub.begin()
+        hal.uart.write("no answer from the hub at 0x55\n")
+    while true
+        match hub.fifo_count()
+            Some(n) =>
+                // The hub makes a report a second at 100 Hz sampling; read the oldest.
+                if n > 0
+                    match hub.report_now()
+                        Some(r) => report(r)
+                        None => hal.uart.write("no answer\n")
+            None => hal.uart.write("no answer\n")
+        hal.timer.delay_ms(1000)
