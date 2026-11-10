@@ -27,14 +27,16 @@ bus.
   of the 10.x firmware, one sample per transaction, decoded against the guide's
   trace, and `HeartRate`'s drain with time stamps.
 - The device program `examples/hr_reader.nv`, a heart rate and SpO2 reader.
-  Built for the nRF52840-DK it is 13,872 B of flash and for the nRF54LM20-DK
-  15,088 B.
+  Built for the nRF52840-DK it is 21,192 B of flash and for the nRF54LM20-DK
+  22,576 B; before the Nordic buses landed, with the reading path left out, it
+  was 13,872 B and 15,088 B.
 
 ### Known
 
 - Hardware verification: NOT VERIFIED. No board on the bench carries the hub.
-  Neither Nordic board has a driver for its two-wire interface (TWIM) at this
-  release, so the device program builds for them and finds an absent bus.
+  The nRF52840 DK drives I2C with TWIM0 and the nRF54LM20 DK with TWIM22, so
+  the device program's images carry the reading path; a reply from the hub over
+  either bus is NOT VERIFIED.
 - The B, C and D variants are NOT IMPLEMENTED; `config_ok` refuses them. Their
   names and algorithms are from the titles of Analog Devices' application notes,
   which could not be fetched.
