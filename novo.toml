@@ -25,4 +25,4 @@ tier = "embedded"
 embedded-hal-nv = "^0.3.2"
 # The HeartRate and Identifiable traits, the wiring record a board's
 # device table hands `attach`, and the register helpers.
-devices-nv      = { path = "../devices-nv" }
+devices-nv      = "^0.3.3"
