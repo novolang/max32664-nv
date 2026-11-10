@@ -18,6 +18,20 @@ part, so the driver has run only against a double of the hub, in the host
 suite. The device program below builds for the nRF52840 DK and the nRF54LM20 DK
 and has not been flashed.
 
+## Install
+
+```sh
+novo pkg add max32664-nv
+```
+
+The device program is `examples/hr_reader.nv`.  Make it the `main` of a package that
+depends on this one and build it for a board:
+
+```sh
+novo build --target=nrf52840-dk src/main.nv
+novo build --target=nrf54lm20-dk src/main.nv
+```
+
 ## The device program
 
 `examples/hr_reader.nv` resets the hub into its application, starts the sensor
@@ -44,7 +58,7 @@ fn digits(n: Int) [hw]
             div = div * 10
     for _k in 0..19
         if div > 0
-            hal.uart.write_byte(48 + (n / div) % 10)
+            hal.uart.write_byte(48 + n / div % 10)
             div = div / 10
 
 // Writes a value in tenths as a decimal with one place: 630 is 63.0.
@@ -71,7 +85,11 @@ fn main() [hw]
     bsp.board.init()
     // The algorithm report only, an interrupt at one sample, the automatic
     // gain control on.
-    let cfg = Max32664Config { variant: Max32664Variant.VariantA, output: 2, algo_mode: 1, threshold: 1, agc: true }
+    let cfg = Max32664Config { variant: Max32664Variant.VariantA,
+        output: 2,
+        algo_mode: 1,
+        threshold: 1,
+        agc: true }
     let w = dev_bus.wiring_en(dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x55), 29), 28)
     let hub = Max32664.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, w, cfg)
     if not hub.begin()
@@ -82,8 +100,8 @@ fn main() [hw]
                 if n > 0
                     match hub.report_now()
                         Some(r) => report(r)
-                        None => hal.uart.write("no answer\n")
-            None => hal.uart.write("no answer\n")
+                        None    => hal.uart.write("no answer\n")
+            None    => hal.uart.write("no answer\n")
         hal.timer.delay_ms(1000)
 ```
 
@@ -161,9 +179,8 @@ the table come from the titles of the application notes, which could not be
 fetched; the User Guide's Table 1 lists only the A variant, and its Table 7
 gives the report layouts of the wrist heart rate, blood pressure and wrist
 SpO2 algorithms, which this driver does not read. The LCSC listing of the
-hub's WLP part names the D variant only (`planning/PERIPHERAL-DRIVER-CANDIDATES.md`,
-section 4.5), so a board built from that part needs the B, C or D support before
-this driver can use it; the SparkFun breakout carries the A variant.
+hub's WLP part names the D variant only, so a board built from that part needs the B, C or D
+support before this driver can use it; the SparkFun breakout carries the A variant.
 
 ### The two modes and their pins
 

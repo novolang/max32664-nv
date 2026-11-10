@@ -51,7 +51,12 @@ fn answer(h: Hub, family: Int, index: Int, vals: [Int])
 // A hub in application mode with the answers of the guide's trace (Table 9).
 @tier(app)
 fn hub() -> Hub
-    let h = Hub { st: HashMap.new(), resp: HashMap.new(), err: HashMap.new(), log: HashMap.new(), pe: HashMap.new(), pt: HashMap.new() }
+    let h = Hub { st: HashMap.new(),
+        resp: HashMap.new(),
+        err: HashMap.new(),
+        log: HashMap.new(),
+        pe: HashMap.new(),
+        pt: HashMap.new() }
     h.st.insert(4, 1)
     answer(h, 0x00, 0x00, [0x88])
     answer(h, 0x02, 0x00, [0x00])
@@ -133,7 +138,7 @@ impl I2cBus for FakeI2c
         var total = n
         if at(self.h.st, 30) == 1
             total = n - 1
-        for i in 0..(total - 1)
+        for i in 0..total - 1
             if status == 0 and i < len
                 list.push(out, at(self.h.resp, key * 100 + i) as u8)
             else
@@ -245,10 +250,31 @@ fn pins_are(h: Hub, want: [Int])
 // 19778, a digit short of the bytes 0x03 0x04 0x92), LED3 0, LED4 11797, heart
 // rate 63.0, confidence 99, SpO2 99.6, state 3.
 fn trace_sample() -> [Int]
-    [0x03, 0x6A, 0x43, 0x03, 0x04, 0x92, 0x00, 0x00, 0x00, 0x00, 0x2E, 0x15, 0x02, 0x76, 0x63, 0x03, 0xE4, 0x03]
+    [0x03,
+        0x6A,
+        0x43,
+        0x03,
+        0x04,
+        0x92,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x2E,
+        0x15,
+        0x02,
+        0x76,
+        0x63,
+        0x03,
+        0xE4,
+        0x03]
 
 fn cfg_of(output: Int, algo: Int) -> Max32664Config
-    Max32664Config { variant: Max32664Variant.VariantA, output: output, algo_mode: algo, threshold: 15, agc: true }
+    Max32664Config { variant: Max32664Variant.VariantA,
+        output: output,
+        algo_mode: algo,
+        threshold: 15,
+        agc: true }
 
 // ── The command frame ────────────────────────────────────────────────
 
@@ -391,16 +417,16 @@ fn test_the_versions_are_three_bytes_each() [io, hw]
             test.assert_eq(v.major, 1)
             test.assert_eq(v.minor, 9)
             test.assert_eq(v.rev, 0)
-        None => test.assert(false)
+        None    => test.assert(false)
     log_is(h, [1, 0xFF, 0x03, -1, 2, 4, -1])
     match max32664.algo_version(d)
         Some(v) => test.assert_eq(v.major, 10)
-        None => test.assert(false)
+        None    => test.assert(false)
     match max32664.bootloader_version(d)
         Some(v) =>
             test.assert_eq(v.major, 3)
             test.assert_eq(v.minor, 0)
-        None => test.assert(false)
+        None    => test.assert(false)
     test.assert(max32664.bootloader_page_size(d) == Some(8192))
     test.assert(max32664.mcu_type(d) == Some(1))
     h.st.insert(4, 0)
@@ -417,7 +443,7 @@ fn test_a_version_is_read_at_any_family_and_index() [io, hw]
             test.assert_eq(v.major, 4)
             test.assert_eq(v.minor, 5)
             test.assert_eq(v.rev, 6)
-        None => test.assert(false)
+        None    => test.assert(false)
     h.err.insert(0x5566, 1)
     test.assert(max32664.version_of(dut(h), 0x55, 0x66) == None)
 
@@ -566,9 +592,21 @@ fn test_the_default_configuration_is_the_guide_s_trace_with_the_agc() [io, hw]
 
 @test
 fn test_only_the_a_variant_with_a_valid_mode_is_run() [io, hw]
-    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantB, output: 3, algo_mode: 1, threshold: 15, agc: true }))
-    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantC, output: 3, algo_mode: 1, threshold: 15, agc: true }))
-    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantD, output: 3, algo_mode: 1, threshold: 15, agc: true }))
+    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantB,
+        output: 3,
+        algo_mode: 1,
+        threshold: 15,
+        agc: true }))
+    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantC,
+        output: 3,
+        algo_mode: 1,
+        threshold: 15,
+        agc: true }))
+    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantD,
+        output: 3,
+        algo_mode: 1,
+        threshold: 15,
+        agc: true }))
     test.assert(not max32664.config_ok(cfg_of(0, 1)))
     test.assert(not max32664.config_ok(cfg_of(4, 1)))
     test.assert(not max32664.config_ok(cfg_of(5, 1)))
@@ -578,9 +616,21 @@ fn test_only_the_a_variant_with_a_valid_mode_is_run() [io, hw]
     test.assert(not max32664.config_ok(cfg_of(3, 0)))
     test.assert(max32664.config_ok(cfg_of(1, 0)))
     test.assert(max32664.config_ok(cfg_of(2, 2)))
-    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantA, output: 3, algo_mode: 1, threshold: 0, agc: true }))
-    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantA, output: 3, algo_mode: 1, threshold: 256, agc: true }))
-    test.assert(max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantA, output: 3, algo_mode: 1, threshold: 255, agc: false }))
+    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantA,
+        output: 3,
+        algo_mode: 1,
+        threshold: 0,
+        agc: true }))
+    test.assert(not max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantA,
+        output: 3,
+        algo_mode: 1,
+        threshold: 256,
+        agc: true }))
+    test.assert(max32664.config_ok(Max32664Config { variant: Max32664Variant.VariantA,
+        output: 3,
+        algo_mode: 1,
+        threshold: 255,
+        agc: false }))
 
 @test
 fn test_a_sample_is_12_bytes_of_leds_and_6_or_11_of_report() [io, hw]
@@ -665,7 +715,11 @@ fn test_sampling_starts_in_the_order_of_the_guide_s_trace() [io, hw]
 @test
 fn test_sampling_with_no_agc_and_the_extended_report() [io, hw]
     let h = hub()
-    let c = Max32664Config { variant: Max32664Variant.VariantA, output: 2, algo_mode: 2, threshold: 1, agc: false }
+    let c = Max32664Config { variant: Max32664Variant.VariantA,
+        output: 2,
+        algo_mode: 2,
+        threshold: 1,
+        agc: false }
     test.assert(max32664.sampling_start(dut(h), c))
     test.assert_eq(at(h.log, 3), 0x02)
     test.assert_eq(at(h.log, 11), 0x01)
@@ -679,7 +733,11 @@ fn test_sampling_start_fails_on_any_one_failed_transaction() [io, hw]
         h.st.insert(2, k)
         test.assert(not max32664.sampling_start(dut(h), max32664.config_default()))
     let h2 = hub()
-    test.assert(not max32664.sampling_start(dut(h2), Max32664Config { variant: Max32664Variant.VariantD, output: 3, algo_mode: 1, threshold: 15, agc: true }))
+    test.assert(not max32664.sampling_start(dut(h2), Max32664Config { variant: Max32664Variant.VariantD,
+        output: 3,
+        algo_mode: 1,
+        threshold: 15,
+        agc: true }))
     test.assert_eq(at(h2.st, 1), 0)
 
 @test
@@ -774,8 +832,8 @@ fn test_the_trace_sample_decodes_as_the_guide_describes_it() [io, hw]
                     test.assert_eq(r.state, 3)
                     test.assert_eq(r.r_x10, 0)
                     test.assert_eq(r.ext_state, 0)
-                None => test.assert(false)
-        None => test.assert(false)
+                None    => test.assert(false)
+        None    => test.assert(false)
     log_is(h, [1, 0x12, 0x01, -1, 2, 19, -1])
 
 @test
@@ -787,11 +845,11 @@ fn test_an_output_of_the_algorithm_only_starts_the_report_at_byte_0() [io, hw]
         Some(r) =>
             test.assert_eq(r.heart_rate_x10, 630)
             test.assert_eq(r.spo2_x10, 996)
-        None => test.assert(false)
+        None    => test.assert(false)
     log_is(h, [1, 0x12, 0x01, -1, 2, 7, -1])
     match max32664.sample_read(d, cfg_of(2, 1))
         Some(s) => test.assert_eq(s.led1, 0)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_an_output_of_the_sensor_only_has_no_report() [io, hw]
@@ -805,7 +863,7 @@ fn test_an_output_of_the_sensor_only_has_no_report() [io, hw]
             test.assert_eq(s.led3, 3)
             test.assert_eq(s.led4, 4)
             test.assert(s.report == None)
-        None => test.assert(false)
+        None    => test.assert(false)
     log_clear(h)
     test.assert(max32664.report_read(d, cfg_of(1, 0)) == None)
     test.assert_eq(at(h.st, 99), 0)
@@ -819,7 +877,7 @@ fn test_the_extended_report_adds_the_r_value_and_the_extended_state() [io, hw]
             test.assert_eq(r.heart_rate_x10, 630)
             test.assert_eq(r.r_x10, 123)
             test.assert_eq(r.ext_state, 5)
-        None => test.assert(false)
+        None    => test.assert(false)
     log_is(h, [1, 0x12, 0x01, -1, 2, 12, -1])
 
 @test
@@ -831,13 +889,28 @@ fn test_a_failed_sample_read_answers_nothing() [io, hw]
 
 @test
 fn test_a_report_is_good_when_a_finger_is_found_with_enough_confidence() [io, hw]
-    let good = Max32664Report { heart_rate_x10: 630, confidence: 99, spo2_x10: 996, state: 3, r_x10: 0, ext_state: 0 }
+    let good = Max32664Report { heart_rate_x10: 630,
+        confidence: 99,
+        spo2_x10: 996,
+        state: 3,
+        r_x10: 0,
+        ext_state: 0 }
     test.assert(max32664.report_good(good, 90))
     test.assert(max32664.report_good(good, 99))
     test.assert(not max32664.report_good(good, 100))
-    let none = Max32664Report { heart_rate_x10: 0, confidence: 99, spo2_x10: 0, state: 0, r_x10: 0, ext_state: 0 }
+    let none = Max32664Report { heart_rate_x10: 0,
+        confidence: 99,
+        spo2_x10: 0,
+        state: 0,
+        r_x10: 0,
+        ext_state: 0 }
     test.assert(not max32664.report_good(none, 0))
-    let other = Max32664Report { heart_rate_x10: 0, confidence: 99, spo2_x10: 0, state: 2, r_x10: 0, ext_state: 0 }
+    let other = Max32664Report { heart_rate_x10: 0,
+        confidence: 99,
+        spo2_x10: 0,
+        state: 2,
+        r_x10: 0,
+        ext_state: 0 }
     test.assert(not max32664.report_good(other, 0))
 
 // ── The PPG samples ──────────────────────────────────────────────────

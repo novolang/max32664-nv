@@ -81,35 +81,35 @@ use dev_ppg.{ PpgSample, PpgLed, HeartRate }
 use dev_id.{ DeviceId, Identifiable }
 
 // The family and index bytes of Table 5.
-let FAM_STATUS = 0x00
-let FAM_MODE_SET = 0x01
-let FAM_MODE_READ = 0x02
-let FAM_OUTPUT = 0x10
-let FAM_FIFO = 0x12
-let FAM_AFE_WRITE = 0x40
-let FAM_AFE_READ = 0x41
+let FAM_STATUS        = 0x00
+let FAM_MODE_SET      = 0x01
+let FAM_MODE_READ     = 0x02
+let FAM_OUTPUT        = 0x10
+let FAM_FIFO          = 0x12
+let FAM_AFE_WRITE     = 0x40
+let FAM_AFE_READ      = 0x41
 let FAM_SENSOR_ENABLE = 0x44
-let FAM_ALGO_ENABLE = 0x52
-let FAM_BL_INFO = 0x81
-let FAM_IDENTITY = 0xFF
+let FAM_ALGO_ENABLE   = 0x52
+let FAM_BL_INFO       = 0x81
+let FAM_IDENTITY      = 0xFF
 
 // The index of the MAX30101 under the register and enable families.
 let IDX_MAX30101 = 0x03
 
 // The delays, in milliseconds: after an ordinary command, after the commands
 // that enable a sensor or an algorithm, between two polls of the mode read.
-let CMD_DELAY_MS = 2
+let CMD_DELAY_MS    = 2
 let ENABLE_DELAY_MS = 45
-let POLL_MS = 10
+let POLL_MS         = 10
 
 // The pin sequences of the User Guide: RSTN low for 10 ms with MFIO at the level
 // of the mode, then RSTN high and 50 ms; and how long the hub is given to answer
 // after that (the application initialises for up to 1.5 s; the bootloader
 // answers sooner).
-let RESET_MS = 10
-let BOOT_MS = 50
+let RESET_MS    = 10
+let BOOT_MS     = 50
 let APP_WAIT_MS = 1700
-let BL_WAIT_MS = 200
+let BL_WAIT_MS  = 200
 
 // The status byte of a command that was taken (Table 4).
 pub const STATUS_OK = 0
@@ -131,8 +131,8 @@ pub const MODE_BOOTLOADER = 0x08
 
 // The bytes of a sample: four LEDs of three bytes; the algorithm report; the
 // extended algorithm report.
-let LED_BYTES = 12
-let ALGO_BYTES = 6
+let LED_BYTES      = 12
+let ALGO_BYTES     = 6
 let ALGO_EXT_BYTES = 11
 
 // The FIFO is read by this driver to 32 samples.
@@ -146,9 +146,9 @@ pub const SAMPLE_PERIOD_US = 10000
 pub const RATE_HZ = 100
 
 // The MAX30101's LED pulse amplitude registers and step (0.2 mA, 0xFF = 51 mA).
-let REG_LED1_PA = 0x0C
-let REG_LED2_PA = 0x0D
-let REG_LED3_PA = 0x0E
+let REG_LED1_PA  = 0x0C
+let REG_LED2_PA  = 0x0D
+let REG_LED3_PA  = 0x0E
 let LED_CODE_MAX = 255
 
 // The firmware variants.
@@ -244,7 +244,7 @@ pub fn i2c_read_resp<B: I2cBus>(bus: B, w: DeviceWiring, n: Int, var dst: DevByt
             for x in b
                 let _ = dst.push(x)
             true
-        None => false
+        None    => false
 
 // Makes the bus ready, at 400 kHz.  Answers whether the wiring has an address.
 pub fn i2c_setup<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
@@ -284,8 +284,8 @@ pub fn mfio_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
 // (0 success, see Table 4), or -1 when the bus failed; the answer bytes are in
 // `out` only for status 0.  A status of 5 (busy) sends the command again, up to
 // three times in all.
-pub fn xfer<P: Max32664Port>(p: P, family: Int, index: Int, data: DevBytes, n: Int,
-                             delay_ms: Int, var out: DevBytes) -> Int [hw]
+pub fn xfer<P: Max32664Port>(p: P, family: Int, index: Int, data: DevBytes, n: Int, delay_ms: Int,
+                             var out: DevBytes) -> Int [hw]
     out.clear()
     if n < 0 or n > 31
         return -1
@@ -319,7 +319,8 @@ pub fn cmd1<P: Max32664Port>(p: P, family: Int, index: Int, byte: Int, delay_ms:
     xfer(p, family, index, data, 0, delay_ms, var out) == STATUS_OK
 
 // A command with two data bytes and no answer.
-pub fn cmd2<P: Max32664Port>(p: P, family: Int, index: Int, b0: Int, b1: Int, delay_ms: Int) -> Bool [hw]
+pub fn cmd2<P: Max32664Port>(p: P, family: Int, index: Int, b0: Int, b1: Int,
+                             delay_ms: Int) -> Bool [hw]
     var data: DevBytes = Vec.new()
     let _ = data.push((b0 & 0xFF) as u8)
     let _ = data.push((b1 & 0xFF) as u8)
@@ -328,7 +329,8 @@ pub fn cmd2<P: Max32664Port>(p: P, family: Int, index: Int, b0: Int, b1: Int, de
 
 // A read command with no data bytes: whether the hub answered, with the
 // `n` bytes in `out`.
-pub fn read_cmd<P: Max32664Port>(p: P, family: Int, index: Int, n: Int, var out: DevBytes) -> Bool [hw]
+pub fn read_cmd<P: Max32664Port>(p: P, family: Int, index: Int, n: Int,
+                                 var out: DevBytes) -> Bool [hw]
     let data: DevBytes = Vec.new()
     xfer(p, family, index, data, n, CMD_DELAY_MS, var out) == STATUS_OK
 
@@ -473,7 +475,11 @@ pub fn enter_bootloader<P: Max32664Port>(p: P) -> Bool [hw]
 // data, the plain report, an interrupt when 15 samples wait, the automatic gain
 // control on.
 pub fn config_default() -> Max32664Config
-    Max32664Config { variant: Max32664Variant.VariantA, output: 3, algo_mode: 1, threshold: 15, agc: true }
+    Max32664Config { variant: Max32664Variant.VariantA,
+        output: 3,
+        algo_mode: 1,
+        threshold: 15,
+        agc: true }
 
 // Whether the driver can run the configuration: the A variant, an output mode of
 // sensor data, algorithm data or both, an algorithm mode of 0 to 2 that is not 0
@@ -597,11 +603,11 @@ pub fn samples_available<P: Max32664Port>(p: P) -> ?Int [hw]
 
 // A 24-bit count from three bytes, most significant first, at `off`.
 pub fn count24(b: DevBytes, off: Int) -> Int
-    ((b[off] as Int) << 16) | ((b[off + 1] as Int) << 8) | (b[off + 2] as Int)
+    (b[off] as Int << 16) | (b[off + 1] as Int << 8) | b[off + 2] as Int
 
 // A 16-bit value from two bytes, most significant first, at `off`.
 pub fn word16(b: DevBytes, off: Int) -> Int
-    ((b[off] as Int) << 8) | (b[off + 1] as Int)
+    (b[off] as Int << 8) | b[off + 1] as Int
 
 // The algorithm report in `b` at `off`; `ext` for the extended layout.
 pub fn report_of(b: DevBytes, off: Int, ext: Bool) -> Max32664Report
@@ -681,7 +687,7 @@ pub fn drain<P: Max32664Port>(p: P, c: Max32664Config, var out: Vec[PpgSample; 3
             Some(s) =>
                 let _ = out.push(PpgSample { red: s.led2, ir: s.led1, green: Some(s.led3),
                                              at_us: now - (n - 1 - k) * SAMPLE_PERIOD_US })
-            None =>
+            None    =>
                 out.clear()
                 return -1
     n
@@ -705,8 +711,8 @@ pub fn rate_set<P: Max32664Port>(p: P, c: Max32664Config) -> Int [hw]
 // The register of the MAX30101 that sets an LED's pulse amplitude.
 pub fn led_reg(led: PpgLed) -> Int
     match led
-        PpgLed.PpgRed => REG_LED1_PA
-        PpgLed.PpgIr => REG_LED2_PA
+        PpgLed.PpgRed   => REG_LED1_PA
+        PpgLed.PpgIr    => REG_LED2_PA
         PpgLed.PpgGreen => REG_LED3_PA
 
 // The pulse-amplitude code for a current in milliamps: the largest step at or
